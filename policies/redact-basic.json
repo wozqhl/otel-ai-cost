@@ -1,0 +1,26 @@
+{
+  "name": "redact-basic",
+  "version": "1.0",
+  "description": "Basic PII/prompt redaction + prefix sample rates (Pro wedge sketch)",
+  "redactAttrs": [
+    "gen_ai.prompt",
+    "gen_ai.completion",
+    "user.email",
+    "user.id"
+  ],
+  "redactAttrPatterns": [
+    "prompt",
+    "completion",
+    "email",
+    "secret",
+    "password",
+    "api[_-]?key",
+    "authorization"
+  ],
+  "sampleRates": [
+    { "prefix": "chat.", "rate": 0.5 },
+    { "prefix": "embeddings", "rate": 1.0 },
+    { "prefix": "*", "rate": 0.25 }
+  ],
+  "defaultSampleRate": 1.0
+}

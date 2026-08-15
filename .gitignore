@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+# A→E dogfood output (regenerate via make dogfood-a-e)
+sdk/generated/

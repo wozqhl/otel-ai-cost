@@ -1,0 +1,8 @@
+node_modules
+__pycache__
+.git
+*.pyc
+.pytest_cache
+out
+data
+sdk

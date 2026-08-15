@@ -1,0 +1,19 @@
+{
+  "name": "@oss-cash-lab/otel-ai-cost",
+  "version": "0.1.0",
+  "description": "AI telemetry cost plane on OpenTelemetry",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "otel-ai-cost": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "smoke": "node src/cli.js smoke",
+    "local-mvp": "bash scripts/local-mvp.sh",
+    "version": "node src/cli.js --version"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,68 @@
+[
+  {
+    "name": "chat.completions",
+    "startTimeUnixNano": "1723334400000000000",
+    "timestamp": "2024-08-11T00:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1200,
+      "gen_ai.usage.output_tokens": 400,
+      "gen_ai.prompt": "secret user question about payroll",
+      "user.email": "alice@example.com",
+      "tenant": "acme"
+    }
+  },
+  {
+    "name": "chat.completions",
+    "startTimeUnixNano": "1723338000000000000",
+    "timestamp": "2024-08-11T01:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "gpt-4o",
+      "gen_ai.usage.input_tokens": 2500,
+      "gen_ai.usage.output_tokens": 900,
+      "gen_ai.completion": "confidential answer"
+    }
+  },
+  {
+    "name": "embeddings",
+    "startTimeUnixNano": "1723420800000000000",
+    "timestamp": "2024-08-12T00:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 800,
+      "gen_ai.usage.output_tokens": 0
+    }
+  },
+  {
+    "name": "chat.completions",
+    "startTimeUnixNano": "1723424400000000000",
+    "timestamp": "2024-08-12T01:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "claude-sonnet",
+      "gen_ai.usage.input_tokens": 1500,
+      "gen_ai.usage.output_tokens": 700,
+      "user.email": "bob@example.com"
+    }
+  },
+  {
+    "name": "chat.completions",
+    "startTimeUnixNano": "1723507200000000000",
+    "timestamp": "2024-08-13T00:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "gpt-4o",
+      "gen_ai.usage.input_tokens": 500,
+      "gen_ai.usage.output_tokens": 200
+    }
+  },
+  {
+    "name": "chat.completions",
+    "startTimeUnixNano": "1723510800000000000",
+    "timestamp": "2024-08-13T01:00:00.000Z",
+    "attributes": {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 300,
+      "gen_ai.usage.output_tokens": 100,
+      "gen_ai.prompt": "another private prompt"
+    }
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "name": "budget-loose",
+  "version": "1.0",
+  "description": "Loose local cost thresholds (examples/spans.json should pass)",
+  "maxTotalUsd": 1.0,
+  "maxPerModelUsd": {
+    "gpt-4o": 1.0,
+    "gpt-4o-mini": 1.0,
+    "claude-sonnet": 1.0
+  }
+}

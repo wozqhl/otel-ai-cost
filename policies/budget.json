@@ -1,0 +1,9 @@
+{
+  "name": "budget-tight",
+  "version": "1.0",
+  "description": "Tight local cost thresholds (examples/spans.json should breach)",
+  "maxTotalUsd": 0.02,
+  "maxPerModelUsd": {
+    "gpt-4o": 0.01
+  }
+}
