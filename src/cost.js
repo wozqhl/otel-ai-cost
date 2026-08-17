@@ -305,6 +305,57 @@ export function applyBudgetDeny(spans, reportResult, tenantBudgets) {
   return { kept, denied: deniedSpans.length, deniedSpans };
 }
 
+/**
+ * Shape for notifyBudgetBreach on HTTP ingest deny.
+ * Once per denied request (not coalesced across requests).
+ * Payload fields: tenant, spend, budget, denied. Never prompt/completion text.
+ */
+export function ingestDenyWebhookCheck(gated, reportResult, tenantBudgets) {
+  const denied = Number(gated?.denied) || 0;
+  const totalUsd =
+    typeof reportResult?.totalUsd === "number" && Number.isFinite(reportResult.totalUsd)
+      ? reportResult.totalUsd
+      : Number(reportResult?.totalUsd) || 0;
+  if (denied < 1) {
+    return { ok: true, breaches: [], totalUsd, denied: 0 };
+  }
+  const first = Array.isArray(gated?.deniedSpans) ? gated.deniedSpans[0] : null;
+  const tenant = spanTenant(first);
+  const items = Array.isArray(reportResult?.budgetBreaches) ? reportResult.budgetBreaches : [];
+  const match = items.find((b) => (b?.tenant || UNKNOWN_TENANT) === tenant);
+  const map = normalizeTenantBudgetMap(tenantBudgets);
+  const spendRaw = match
+    ? Number(match.usd)
+    : Number((reportResult?.byTenant || []).find((t) => (t?.tenant || UNKNOWN_TENANT) === tenant)?.usd) || 0;
+  const budgetRaw = match
+    ? Number(match.budget)
+    : Object.prototype.hasOwnProperty.call(map, tenant)
+      ? Number(map[tenant])
+      : 0;
+  const spend = Number(Number(spendRaw).toFixed(6));
+  const budget = Number.isFinite(budgetRaw) ? Number(budgetRaw) : 0;
+  return {
+    ok: false,
+    tenant,
+    spend,
+    budget,
+    denied,
+    totalUsd: spend,
+    breaches: [
+      {
+        type: "ingestDeny",
+        tenant,
+        usd: spend,
+        budget,
+        limit: budget,
+        actual: spend,
+        denied,
+        message: `ingest denied: tenant ${tenant} over budget (spend=${spend} budget=${budget} denied=${denied})`,
+      },
+    ],
+  };
+}
+
 /** Shape for notifyBudgetBreach: one payload with tenant on each breach + top-level tenant. */
 export function tenantBudgetWebhookCheck(reportResult) {
   const items = Array.isArray(reportResult?.budgetBreaches) ? reportResult.budgetBreaches : [];

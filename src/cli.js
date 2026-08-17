@@ -20,6 +20,7 @@ import {
   parseTenantBudgets,
   resolveTenantBudgets,
   tenantBudgetWebhookCheck,
+  ingestDenyWebhookCheck,
   applyBudgetDeny,
   tenantBudgetRemaining,
   budgetsJson,
@@ -849,6 +850,30 @@ if (cmd === "--version" || cmd === "-V") {
     console.error("smoke applyBudgetDeny kept+denied must cover input", denyHit);
     process.exit(1);
   }
+  const denyCheck = ingestDenyWebhookCheck(denyHit, tbHigh, { acme: 0.01 });
+  const denyPayload = buildWebhookPayload(denyCheck);
+  const denyPayloadBlob = JSON.stringify(denyPayload);
+  if (
+    denyCheck.ok !== false ||
+    denyCheck.tenant !== "acme" ||
+    !(Number(denyCheck.denied) >= 1) ||
+    !(Number(denyCheck.spend) > 0.01) ||
+    Number(denyCheck.budget) !== 0.01 ||
+    denyPayload.tenant !== "acme" ||
+    Number(denyPayload.denied) !== Number(denyCheck.denied) ||
+    Number(denyPayload.spend) !== Number(denyCheck.spend) ||
+    Number(denyPayload.budget) !== 0.01 ||
+    denyPayloadBlob.includes("SECRET") ||
+    denyPayloadBlob.includes("gen_ai.prompt")
+  ) {
+    console.error("smoke ingestDenyWebhookCheck failed", denyCheck, denyPayload);
+    process.exit(1);
+  }
+  const denySkip = ingestDenyWebhookCheck(denyPass, r, {});
+  if (denySkip.ok !== true || Number(denySkip.denied) !== 0) {
+    console.error("smoke ingestDenyWebhookCheck no-deny should be ok", denySkip);
+    process.exit(1);
+  }
   const hookOk =
     resolveWebhookUrl(null, {}) == null &&
     resolveWebhookUrl(null, { [ENV_WEBHOOK_URL]: "http://127.0.0.1:9/hook" }) ===
@@ -1298,6 +1323,8 @@ if (cmd === "--version" || cmd === "-V") {
     Boolean((((specPaths["/v1/traces"] || {}).post || {}).responses || {})["200"]) &&
     Boolean((((specPaths["/v1/traces"] || {}).post || {}).responses || {})["400"]) &&
     Boolean((((specPaths["/v1/traces"] || {}).post || {}).responses || {})["401"]) &&
+    JSON.stringify((spec.components || {}).schemas?.IngestAccepted || {}).includes("denied") &&
+    (specDesc.includes("ingest deny") || specDesc.includes("denied request") || specDesc.includes("once per denied")) &&
     (specDesc.includes("/v1/traces") || specDesc.includes("OTLP"));
   if (!openapiOk) {
     console.error("smoke failed openapi", { specMissing, traces: specPaths["/v1/traces"] });
@@ -2490,6 +2517,129 @@ if (cmd === "--version" || cmd === "-V") {
     await closeServer(oversizeServed.server);
   }
 
+  const denySpan = {
+    timestamp: "2024-08-18T00:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 10,
+      "gen_ai.usage.output_tokens": 5,
+      tenant: "acme",
+      "gen_ai.prompt": "SECRET_PROMPT_DENY",
+    },
+  };
+  const noHookDenyServed = createReportServer({
+    spans: acmeHighSpans,
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: parseTenantBudgets("acme=0.01"),
+  });
+  const noHookDenyAddr = await listen(noHookDenyServed.server, 0, "127.0.0.1");
+  try {
+    const noHookDeny = await fetch(`http://127.0.0.1:${noHookDenyAddr.port}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [denySpan] }),
+    });
+    const noHookDenyBody = await noHookDeny.json();
+    if (
+      noHookDeny.status !== 200 ||
+      noHookDenyBody.ok !== true ||
+      noHookDenyBody.accepted !== 1 ||
+      noHookDenyBody.denied !== 1
+    ) {
+      console.error("smoke ingest deny without webhook failed", noHookDeny.status, noHookDenyBody);
+      process.exit(1);
+    }
+  } finally {
+    await closeServer(noHookDenyServed.server);
+  }
+
+  const ingestHookReceived = [];
+  const ingestHookMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      ingestHookReceived.push({
+        method: req.method,
+        url: req.url,
+        headers: { ...req.headers },
+        raw: Buffer.concat(chunks).toString("utf8"),
+      });
+      const ack = JSON.stringify({ ok: true });
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": Buffer.byteLength(ack),
+      });
+      res.end(ack);
+    });
+  });
+  const ingestHookMockAddr = await listen(ingestHookMock, 0, "127.0.0.1");
+  const ingestHookSecret = "whsec_ingest_deny_smoke";
+  const ingestHookServed = createReportServer({
+    spans: acmeHighSpans,
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: parseTenantBudgets("acme=0.01"),
+    webhookUrl: `http://127.0.0.1:${ingestHookMockAddr.port}/hook`,
+    webhookSecret: ingestHookSecret,
+  });
+  const ingestHookAddr = await listen(ingestHookServed.server, 0, "127.0.0.1");
+  try {
+    const hookDeny = await fetch(`http://127.0.0.1:${ingestHookAddr.port}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [denySpan] }),
+    });
+    const hookDenyBody = await hookDeny.json();
+    if (
+      hookDeny.status !== 200 ||
+      hookDenyBody.ok !== true ||
+      hookDenyBody.accepted !== 1 ||
+      hookDenyBody.denied !== 1
+    ) {
+      console.error("smoke ingest deny with webhook HTTP failed", hookDeny.status, hookDenyBody);
+      process.exit(1);
+    }
+    if (ingestHookReceived.length !== 1) {
+      console.error("smoke ingest deny webhook call count", ingestHookReceived.length, ingestHookReceived);
+      process.exit(1);
+    }
+    let hookBody;
+    try {
+      hookBody = JSON.parse(ingestHookReceived[0].raw);
+    } catch {
+      hookBody = null;
+    }
+    const acmeSpendRow = (tbHigh.byTenant || []).find((t) => t.tenant === "acme");
+    const hookSig = ingestHookReceived[0].headers["x-webhook-signature"];
+    const hookTs = ingestHookReceived[0].headers["x-webhook-timestamp"];
+    const hookRaw = ingestHookReceived[0].raw;
+    if (
+      !hookBody ||
+      hookBody.ok !== false ||
+      hookBody.tenant !== "acme" ||
+      Number(hookBody.spend) !== Number(acmeSpendRow?.usd) ||
+      Number(hookBody.budget) !== 0.01 ||
+      Number(hookBody.denied) !== 1 ||
+      hookRaw.includes("SECRET_PROMPT_DENY") ||
+      hookRaw.includes("gen_ai.prompt") ||
+      !hookSig ||
+      !verifyWebhookSignature(ingestHookSecret, hookRaw, hookSig) ||
+      !hookTs ||
+      !/^\d+$/.test(String(hookTs))
+    ) {
+      console.error("smoke ingest deny webhook payload/HMAC failed", {
+        hookBody,
+        headers: ingestHookReceived[0].headers,
+        acmeSpendRow,
+      });
+      process.exit(1);
+    }
+  } finally {
+    await closeServer(ingestHookServed.server);
+    await closeServer(ingestHookMock);
+  }
+
   const spanMaxOk =
     DEFAULT_SPAN_MAX === 50000 &&
     ENV_SPAN_MAX === "SPAN_MAX" &&
@@ -2575,7 +2725,7 @@ if (cmd === "--version" || cmd === "-V") {
     process.exit(1);
   }
 
-  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax`);
+  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook`);
 } else if (cmd === "models" || cmd === "prices") {
   console.log(JSON.stringify(modelsJson(), null, 2));
 } else if (cmd === "demo") {

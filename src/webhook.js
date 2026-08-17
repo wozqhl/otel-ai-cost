@@ -1,6 +1,8 @@
 /** Optional budget-breach webhook (fire-and-forget; stdlib fetch).
  *
- * OSS: best-effort POST when report --budget / check-budget exceeds limits.
+ * OSS: best-effort POST when report --budget / check-budget exceeds limits,
+ * or when HTTP ingest denies a span because the tenant is already over budget
+ * (once per denied request).
  * Optional simple HMAC-SHA256 (`--webhook-secret` / OTEL_AI_COST_WEBHOOK_SECRET)
  * → `X-Webhook-Signature: sha256=<hex>` of the raw JSON body.
  * Always sends `X-Webhook-Timestamp: <unix-seconds>` (HMAC still body-only).
@@ -94,7 +96,9 @@ export function verifyWebhookSignature(secret, rawBody, headerValue) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/** Outbound body on breach only: {ok:false, breaches, totalUsd} (+ tenant when set). Never tokens. */
+/** Outbound body on breach only: {ok:false, breaches, totalUsd} (+ tenant when set).
+ * Ingest deny also adds spend, budget, denied. Never tokens or prompt text.
+ */
 export function buildWebhookPayload(check) {
   const breaches = Array.isArray(check?.breaches) ? check.breaches : [];
   const totalUsd =
@@ -108,6 +112,15 @@ export function buildWebhookPayload(check) {
   };
   if (check?.tenant != null && String(check.tenant).trim() !== "") {
     payload.tenant = String(check.tenant);
+  }
+  if (check?.spend != null && Number.isFinite(Number(check.spend))) {
+    payload.spend = Number(check.spend);
+  }
+  if (check?.budget != null && Number.isFinite(Number(check.budget))) {
+    payload.budget = Number(check.budget);
+  }
+  if (check?.denied != null && Number.isFinite(Number(check.denied))) {
+    payload.denied = Math.floor(Number(check.denied));
   }
   return payload;
 }

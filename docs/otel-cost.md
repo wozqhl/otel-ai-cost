@@ -52,7 +52,7 @@ HTTP JSON (`GET /report.json`, `GET /v1/costs`, `GET /v1/tenants`) already expos
 | `otel_ai_cost_output_tokens` | gauge | sum of `outTok` |
 | `otel_ai_cost_span_count` | counter | snapshot row count |
 
-**Budget deny:** after a tenant spend is already greater than its budget, further `POST /v1/traces` spans for that tenant are **not stored**. The POST stays **200** `{ ok, accepted, denied }` (`accepted` is still the parsed count, same as span-max). `_` is not gated unless you set a budget for `_`. No tenant budgets means deny never fires.
+**Budget deny:** after a tenant spend is already greater than its budget, further `POST /v1/traces` spans for that tenant are **not stored**. The POST stays **200** `{ ok, accepted, denied }` (`accepted` is still the parsed count, same as span-max). `_` is not gated unless you set a budget for `_`. No tenant budgets means deny never fires. When `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL → still **200** `{denied:N}`.
 
 Grafana: dedicated `deploy/grafana/e-otel-ai-cost.json` (per-tenant spend, remaining, deny, tokens, top models). Shared portfolio panels (Total USD, Cost by model) stay in `oss-cash-lab.json` — do not edit that file from this stream.
 

@@ -1521,7 +1521,119 @@ CFG_ISO_PID=""
 trap - EXIT
 echo "==> [config] isolated webhook not leaked OK"
 
+echo "==> [ingest-deny-webhook] isolated over-budget ingest (no URL → 200 denied:1; mock receiver POST)"
+INGEST_DENY_NOWH_PORT="${INGEST_DENY_NOWH_PORT:-8842}"
+INGEST_DENY_WH_PORT="${INGEST_DENY_WH_PORT:-8843}"
+INGEST_DENY_PORT="${INGEST_DENY_PORT:-8844}"
+INGEST_DENY_SPANS="$ROOT/out/ingest-deny-spans.json"
+INGEST_DENY_NOWH_LOG="$ROOT/out/ingest-deny-nowh-serve.log"
+INGEST_DENY_LOG="$ROOT/out/ingest-deny-serve.log"
+INGEST_DENY_WH_OUT="$ROOT/out/ingest-deny-webhook-last.json"
+INGEST_DENY_WH_HDR="$ROOT/out/ingest-deny-webhook-last.headers.json"
+INGEST_DENY_WH_LOG="$ROOT/out/ingest-deny-webhook.log"
+rm -f "$INGEST_DENY_NOWH_LOG" "$INGEST_DENY_LOG" "$INGEST_DENY_WH_OUT" "$INGEST_DENY_WH_HDR" "$INGEST_DENY_WH_LOG" \
+  out/ingest-deny-nowh.json out/ingest-deny-post.json
+printf '%s\n' '[{"timestamp":"2024-08-11T12:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o","gen_ai.usage.input_tokens":5000,"gen_ai.usage.output_tokens":1000,"tenant":"acme"}}]' > "$INGEST_DENY_SPANS"
+unset OTEL_AI_COST_WEBHOOK_URL OTEL_AI_COST_WEBHOOK_SECRET || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset INGEST_TOKEN RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM || true
+
+node src/cli.js serve --port "$INGEST_DENY_NOWH_PORT" --in "$INGEST_DENY_SPANS" \
+  --tenant-budget "acme=0.01" >"$INGEST_DENY_NOWH_LOG" 2>&1 &
+INGEST_DENY_NOWH_PID=$!
+cleanup_ingest_deny_nowh() {
+  if [ -n "${INGEST_DENY_NOWH_PID:-}" ] && kill -0 "$INGEST_DENY_NOWH_PID" 2>/dev/null; then
+    kill "$INGEST_DENY_NOWH_PID" 2>/dev/null || true
+    wait "$INGEST_DENY_NOWH_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_ingest_deny_nowh EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$INGEST_DENY_NOWH_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "ingest-deny no-webhook serve did not become healthy"
+    cat "$INGEST_DENY_NOWH_LOG" || true
+    exit 1
+  fi
+done
+NOWH="$(curl -s -o out/ingest-deny-nowh.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$INGEST_DENY_NOWH_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-08-18T00:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":5,"tenant":"acme","gen_ai.prompt":"SECRET_PROMPT_DENY"}}]}')"
+echo "ingest_deny_nowh_status=$NOWH body=$(cat out/ingest-deny-nowh.json)"
+test "$NOWH" = "200"
+grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' out/ingest-deny-nowh.json
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/ingest-deny-nowh.json
+cleanup_ingest_deny_nowh
+INGEST_DENY_NOWH_PID=""
+trap - EXIT
+
+node mock-webhook-receiver.js --port "$INGEST_DENY_WH_PORT" --out "$INGEST_DENY_WH_OUT" \
+  --headers-out "$INGEST_DENY_WH_HDR" --secret "whsec_ingest_deny_mvp" >"$INGEST_DENY_WH_LOG" 2>&1 &
+INGEST_DENY_WH_PID=$!
+node src/cli.js serve --port "$INGEST_DENY_PORT" --in "$INGEST_DENY_SPANS" \
+  --tenant-budget "acme=0.01" \
+  --webhook-url "http://127.0.0.1:${INGEST_DENY_WH_PORT}/hook" \
+  --webhook-secret "whsec_ingest_deny_mvp" >"$INGEST_DENY_LOG" 2>&1 &
+INGEST_DENY_PID=$!
+cleanup_ingest_deny() {
+  if [ -n "${INGEST_DENY_PID:-}" ] && kill -0 "$INGEST_DENY_PID" 2>/dev/null; then
+    kill "$INGEST_DENY_PID" 2>/dev/null || true
+    wait "$INGEST_DENY_PID" 2>/dev/null || true
+  fi
+  if [ -n "${INGEST_DENY_WH_PID:-}" ] && kill -0 "$INGEST_DENY_WH_PID" 2>/dev/null; then
+    kill "$INGEST_DENY_WH_PID" 2>/dev/null || true
+    wait "$INGEST_DENY_WH_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_ingest_deny EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$INGEST_DENY_WH_PORT/health" >/dev/null \
+    && curl -sf "http://127.0.0.1:$INGEST_DENY_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "ingest-deny webhook serve did not become healthy"
+    cat "$INGEST_DENY_WH_LOG" || true
+    cat "$INGEST_DENY_LOG" || true
+    exit 1
+  fi
+done
+DENY_WH="$(curl -s -o out/ingest-deny-post.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$INGEST_DENY_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-08-18T00:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":5,"tenant":"acme","gen_ai.prompt":"SECRET_PROMPT_DENY"}}]}')"
+echo "ingest_deny_webhook_status=$DENY_WH body=$(cat out/ingest-deny-post.json)"
+test "$DENY_WH" = "200"
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/ingest-deny-post.json
+test -s "$INGEST_DENY_WH_OUT"
+node -e '
+const fs=require("fs");
+const d=JSON.parse(fs.readFileSync("out/ingest-deny-webhook-last.json","utf8"));
+const meta=JSON.parse(fs.readFileSync("out/ingest-deny-webhook-last.headers.json","utf8"));
+const blob=JSON.stringify(d);
+if(d.ok!==false || d.tenant!=="acme" || !(Number(d.spend)>0.01) || Number(d.budget)!==0.01 || Number(d.denied)!==1) {
+  console.error("ingest deny webhook payload", d); process.exit(1);
+}
+if(blob.includes("SECRET_PROMPT_DENY") || blob.includes("gen_ai.prompt")) {
+  console.error("ingest deny webhook leaked prompt", d); process.exit(1);
+}
+if(meta.verified!==true || !meta.timestamp) {
+  console.error("ingest deny webhook HMAC/timestamp", meta); process.exit(1);
+}
+console.log("ingest_deny_webhook_ok", {tenant:d.tenant, spend:d.spend, budget:d.budget, denied:d.denied});
+'
+cleanup_ingest_deny
+INGEST_DENY_PID=""
+INGEST_DENY_WH_PID=""
+trap - EXIT
+echo "==> [ingest-deny-webhook] isolated mock receiver POST + no-URL 200 denied:1 OK"
+
 echo "==> [otlp-demo] local OTLP ingest + tenant/budget metrics"
 OTLP_DEMO_PORT="${OTLP_DEMO_PORT:-8841}" bash "$ROOT/scripts/otlp-demo.sh"
 
-echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+otlpDemo)"
+echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+otlpDemo)"

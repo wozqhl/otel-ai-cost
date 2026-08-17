@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, DEFAULT_PRICES, applyBudgetDeny, spanTenant } from "./cost.js";
+import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, DEFAULT_PRICES, applyBudgetDeny, spanTenant, ingestDenyWebhookCheck } from "./cost.js";
 import { corsResponseHeaders, handlePreflight, normalizeCors } from "./cors.js";
 import { resolveRequestId, REQUEST_ID_HEADER } from "./request-id.js";
 import { attachAccessLog } from "./access-log.js";
@@ -21,6 +21,7 @@ import {
   isIngestPath,
   readJsonBody,
 } from "./ingest.js";
+import { notifyBudgetBreach } from "./webhook.js";
 import { summarizeRuntimeConfig } from "./runtime-config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -204,6 +205,7 @@ export function startSpansWatch(filePath, { reload, load = loadSpansFile, pollMs
  * GET /health, GET /ready, GET / (HTML + SVG, daily when groupBy=day), GET /report.json,
  * GET /v1/costs.csv, GET /v1/costs.md, GET /v1/costs.gha.txt, GET /v1/costs?format=csv|json|md|gha, GET /v1/budgets, GET /v1/models, GET /v1/config, GET /v1/spans, GET /v1/tenants, GET /openapi.json, GET /metrics
  * POST /v1/traces (alias POST /v1/otlp/v1/traces) OTLP JSON ingest into the in-memory store.
+ * Over-budget ingest deny fires the existing webhook once per denied request (HMAC/timestamp if set).
  * Optional CORS: corsOrigins CSV list (`*` allowed); empty/omit = deny extra CORS.
  * `reload(spans)` replaces the in-memory store (watch) then caps; ingested spans are not kept.
  * Over `--span-max` / SPAN_MAX (default 50000; 0 = unlimited), drop oldest. Costs recompute from the window.
@@ -284,7 +286,11 @@ export function createReportServer({
 
   function ingest(incoming) {
     const list = Array.isArray(incoming) ? incoming : [];
-    const gated = applyBudgetDeny(list, snap.report, tenantBudgets);
+    const reportAtDeny = snap.report;
+    const gated = applyBudgetDeny(list, reportAtDeny, tenantBudgets);
+    const denyCheck = gated.denied
+      ? ingestDenyWebhookCheck(gated, reportAtDeny, tenantBudgets)
+      : null;
     if (gated.denied) {
       denyTotal += gated.denied;
       for (const span of gated.deniedSpans) {
@@ -295,7 +301,7 @@ export function createReportServer({
     if (gated.kept.length) store.push(...gated.kept);
     capSpans(store, resolvedSpanMax);
     rebuild();
-    return { ok: true, accepted: list.length, denied: gated.denied, stored: gated.kept.length };
+    return { ok: true, accepted: list.length, denied: gated.denied, stored: gated.kept.length, denyCheck };
   }
 
   const server = http.createServer((req, res) => {
@@ -502,6 +508,12 @@ export function createReportServer({
     }
     const incoming = extractIngestSpans(body);
     const result = ingest(incoming);
+    // Once per denied request. No URL → skip. Errors never change the 200.
+    if (result.denyCheck && resolvedWebhookUrl) {
+      await notifyBudgetBreach(resolvedWebhookUrl, result.denyCheck, {
+        secret: resolvedWebhookSecret,
+      });
+    }
     sendJson(res, 200, { ok: true, accepted: result.accepted, denied: result.denied || 0 }, extra);
   }
 

@@ -3,6 +3,7 @@
 ## Now (local-mvp)
 
 - OTel-native tenant spend + budget deny from GenAI span attributes.
+- Budget-breach webhook on HTTP ingest deny (once per denied request).
 - Prometheus series for total / model / tenant / remaining / deny / tokens.
 - Dedicated Grafana JSON plus the shared portfolio Total USD / Cost by model panels.
 - Local OTLP demo (no Docker).
