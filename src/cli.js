@@ -20,6 +20,8 @@ import {
   parseTenantBudgets,
   resolveTenantBudgets,
   tenantBudgetWebhookCheck,
+  applyBudgetDeny,
+  tenantBudgetRemaining,
   budgetsJson,
   modelsJson,
   spansJson,
@@ -806,10 +808,45 @@ if (cmd === "--version" || cmd === "-V") {
     !metricsSnap.includes("otel_ai_cost_total_usd") ||
     !metricsSnap.includes("otel_ai_cost_by_model_usd") ||
     !metricsSnap.includes("otel_ai_cost_span_count") ||
+    !metricsSnap.includes("otel_ai_cost_by_tenant_usd") ||
+    !metricsSnap.includes("otel_ai_cost_budget_remaining_usd") ||
+    !metricsSnap.includes("otel_ai_cost_budget_deny_total") ||
+    !metricsSnap.includes("otel_ai_cost_input_tokens") ||
+    !metricsSnap.includes("otel_ai_cost_output_tokens") ||
     !metricsSnap.includes('# TYPE otel_ai_cost_total_usd gauge') ||
-    !metricsSnap.includes('# TYPE otel_ai_cost_span_count counter')
+    !metricsSnap.includes('# TYPE otel_ai_cost_span_count counter') ||
+    !metricsSnap.includes('# TYPE otel_ai_cost_budget_deny_total counter')
   ) {
     console.error("smoke metrics render failed", metricsSnap);
+    process.exit(1);
+  }
+  const tbMetrics = renderCostMetrics(tbHigh, { tenantBudgets: { acme: 0.01 } });
+  if (
+    !tbMetrics.includes('otel_ai_cost_by_tenant_usd{tenant="acme"}') ||
+    !tbMetrics.includes("otel_ai_cost_budget_remaining_usd{tenant=\"acme\"}") ||
+    !tbMetrics.includes("otel_ai_cost_budget_deny_total{tenant=\"acme\"}")
+  ) {
+    console.error("smoke tenant/budget metrics failed", tbMetrics);
+    process.exit(1);
+  }
+  const remain = tenantBudgetRemaining(tbHigh.byTenant, { acme: 0.01 });
+  const acmeRemain = remain.find((x) => x.tenant === "acme");
+  if (!acmeRemain || !(Number(acmeRemain.remaining) < 0)) {
+    console.error("smoke tenantBudgetRemaining expected negative acme", remain);
+    process.exit(1);
+  }
+  const denyPass = applyBudgetDeny(demoSpans, r, {});
+  const denyHit = applyBudgetDeny(demoSpans, tbHigh, { acme: 0.01 });
+  if (denyPass.denied !== 0 || denyPass.kept.length !== demoSpans.length) {
+    console.error("smoke applyBudgetDeny no-budget should keep all", denyPass);
+    process.exit(1);
+  }
+  if (denyHit.denied < 1 || !denyHit.deniedSpans.some((s) => (s.attributes || {}).tenant === "acme")) {
+    console.error("smoke applyBudgetDeny should deny acme when breached", denyHit);
+    process.exit(1);
+  }
+  if (denyHit.kept.length + denyHit.denied !== demoSpans.length) {
+    console.error("smoke applyBudgetDeny kept+denied must cover input", denyHit);
     process.exit(1);
   }
   const hookOk =
@@ -1602,7 +1639,10 @@ if (cmd === "--version" || cmd === "-V") {
       !metricsCt.includes("text/plain") ||
       !metricsText.includes("otel_ai_cost_total_usd") ||
       !metricsText.includes("otel_ai_cost_by_model_usd") ||
-      !metricsText.includes("otel_ai_cost_span_count")
+      !metricsText.includes("otel_ai_cost_span_count") ||
+      !metricsText.includes("otel_ai_cost_by_tenant_usd") ||
+      !metricsText.includes("otel_ai_cost_budget_deny_total") ||
+      !metricsText.includes("otel_ai_cost_input_tokens")
     ) {
       console.error("smoke serve /metrics failed", metricsRes.status, metricsCt, metricsText.slice(0, 200));
       process.exit(1);

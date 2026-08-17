@@ -251,6 +251,60 @@ export function tenantBudgetBreaches(byTenant, budgets) {
   return out;
 }
 
+/**
+ * Remaining USD per configured tenant (budget - spend).
+ * Missing spend → 0. Tenants without a budget are omitted.
+ * Remaining may be negative when already over budget (honest, not clamped).
+ */
+export function tenantBudgetRemaining(byTenant, budgets) {
+  const map = normalizeTenantBudgetMap(budgets);
+  const spend = new Map();
+  for (const row of byTenant || []) {
+    const tenant = row?.tenant || UNKNOWN_TENANT;
+    spend.set(tenant, Number(row?.usd) || 0);
+  }
+  const out = [];
+  for (const tenant of Object.keys(map).sort()) {
+    const usd = spend.has(tenant) ? spend.get(tenant) : 0;
+    const budget = map[tenant];
+    out.push({
+      tenant,
+      usd: Number(Number(usd).toFixed(6)),
+      budget,
+      remaining: Number((budget - usd).toFixed(6)),
+    });
+  }
+  return out;
+}
+
+/**
+ * Split incoming spans into kept vs budget-denied.
+ * A tenant already in breach (`usd` > budget) is denied further ingest.
+ * `_` is not gated unless `_` is explicitly budgeted (same as tenantBudgetBreaches).
+ * Does not mutate spans. Empty/invalid → `{ kept: [], denied: 0, deniedSpans: [] }`.
+ */
+export function applyBudgetDeny(spans, reportResult, tenantBudgets) {
+  const list = Array.isArray(spans) ? spans : [];
+  const breaches = Array.isArray(reportResult?.budgetBreaches)
+    ? reportResult.budgetBreaches
+    : tenantBudgetBreaches(reportResult?.byTenant || [], tenantBudgets);
+  const breached = new Set();
+  for (const b of breaches || []) {
+    breached.add(b?.tenant || UNKNOWN_TENANT);
+  }
+  if (!breached.size) {
+    return { kept: list.slice(), denied: 0, deniedSpans: [] };
+  }
+  const kept = [];
+  const deniedSpans = [];
+  for (const span of list) {
+    const tenant = spanTenant(span);
+    if (breached.has(tenant)) deniedSpans.push(span);
+    else kept.push(span);
+  }
+  return { kept, denied: deniedSpans.length, deniedSpans };
+}
+
 /** Shape for notifyBudgetBreach: one payload with tenant on each breach + top-level tenant. */
 export function tenantBudgetWebhookCheck(reportResult) {
   const items = Array.isArray(reportResult?.budgetBreaches) ? reportResult.budgetBreaches : [];

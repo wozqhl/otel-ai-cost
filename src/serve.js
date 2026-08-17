@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, DEFAULT_PRICES } from "./cost.js";
+import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, DEFAULT_PRICES, applyBudgetDeny, spanTenant } from "./cost.js";
 import { corsResponseHeaders, handlePreflight, normalizeCors } from "./cors.js";
 import { resolveRequestId, REQUEST_ID_HEADER } from "./request-id.js";
 import { attachAccessLog } from "./access-log.js";
@@ -149,14 +149,14 @@ export function loadSpansFile(file) {
   throw new Error("spans JSON must be an array or {spans:[]} or OTLP resourceSpans");
 }
 
-function snapshotFromSpans(spans, { groupBy, prices, version, tenantBudgets, budget }) {
+function snapshotFromSpans(spans, { groupBy, prices, version, tenantBudgets, budget, denyTotal, denyByTenant }) {
   const r = report(spans || [], prices, { tenantBudgets });
   const html = formatHtml(r, { groupBy: groupBy === "day" ? "day" : groupBy || null });
   const json = reportJson(r, { groupBy });
   const csv = formatCsv(r);
   const md = formatMd(r);
   const gha = formatGha(r, { budget });
-  const metricsText = renderCostMetrics(r);
+  const metricsText = renderCostMetrics(r, { tenantBudgets, denyTotal, denyByTenant });
   const health = {
     ok: true,
     service: "otel-ai-cost",
@@ -236,10 +236,15 @@ export function createReportServer({
   const resolvedWebhookSecret = webhookSecret == null || webhookSecret === "" ? null : String(webhookSecret);
   let store = Array.isArray(spans) ? spans.slice() : [];
   capSpans(store, resolvedSpanMax);
+  let denyTotal = 0;
+  const denyByTenant = new Map();
   function allSpans() {
     return store;
   }
-  let snap = snapshotFromSpans(allSpans(), snapOpts);
+  function snapOptsWithDeny() {
+    return { ...snapOpts, denyTotal, denyByTenant };
+  }
+  let snap = snapshotFromSpans(allSpans(), snapOptsWithDeny());
   const cors = normalizeCors(corsOrigins);
   const specPath = openapiPath || DEFAULT_OPENAPI_PATH;
   let shuttingDown = false;
@@ -267,7 +272,7 @@ export function createReportServer({
   }
 
   function rebuild() {
-    snap = snapshotFromSpans(allSpans(), snapOpts);
+    snap = snapshotFromSpans(allSpans(), snapOptsWithDeny());
     return snap;
   }
 
@@ -279,10 +284,18 @@ export function createReportServer({
 
   function ingest(incoming) {
     const list = Array.isArray(incoming) ? incoming : [];
-    if (list.length) store.push(...list);
+    const gated = applyBudgetDeny(list, snap.report, tenantBudgets);
+    if (gated.denied) {
+      denyTotal += gated.denied;
+      for (const span of gated.deniedSpans) {
+        const tenant = spanTenant(span);
+        denyByTenant.set(tenant, (denyByTenant.get(tenant) || 0) + 1);
+      }
+    }
+    if (gated.kept.length) store.push(...gated.kept);
     capSpans(store, resolvedSpanMax);
     rebuild();
-    return { ok: true, accepted: list.length };
+    return { ok: true, accepted: list.length, denied: gated.denied, stored: gated.kept.length };
   }
 
   const server = http.createServer((req, res) => {
@@ -489,7 +502,7 @@ export function createReportServer({
     }
     const incoming = extractIngestSpans(body);
     const result = ingest(incoming);
-    sendJson(res, 200, { ok: true, accepted: result.accepted }, extra);
+    sendJson(res, 200, { ok: true, accepted: result.accepted, denied: result.denied || 0 }, extra);
   }
 
   return {

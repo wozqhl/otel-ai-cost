@@ -59,12 +59,14 @@ Token invoices are too coarse. Attribute cost from OTel spans to teams/features 
 - [x] HTTP rate limit (`--rate-limit` / `RATE_LIMIT_PER_MINUTE` default 120; IP sliding window; 429 + `Retry-After`; skip `/health` `/ready` `/metrics`)
 - [x] `X-Request-Id` (incoming or generated UUID; echo every response incl 4xx/OPTIONS)
 - [x] OpenAPI 3 (`openapi/cost.openapi.json` + `GET /openapi.json`; `/ready` `getReady`; 403 CORS notes; `X-Request-Id`)
-- [x] Prometheus `GET /metrics` (`otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_span_count`; CORS same as other GET)
+- [x] Prometheus `GET /metrics` (`otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_by_tenant_usd{tenant}`, `otel_ai_cost_budget_remaining_usd{tenant}`, `otel_ai_cost_budget_deny_total`, `otel_ai_cost_input_tokens`, `otel_ai_cost_output_tokens`, `otel_ai_cost_span_count`; CORS same as other GET)
+- [x] Dedicated Grafana dashboard `deploy/grafana/e-otel-ai-cost.json` (shared `oss-cash-lab.json` E panels unchanged)
+- [x] Local OTLP demo `scripts/otlp-demo.sh` (no Docker; wired from local-mvp)
 - [x] Demo with sample spans
 
 ## Quick start
 
-See scripts/local-mvp.sh for the full demo commands (smoke, report, budget tight/loose, filter with policy pack, route multi-sink).
+See scripts/local-mvp.sh for the full demo commands (smoke, report, budget tight/loose, filter with policy pack, route multi-sink, otlp-demo). Attributes and positioning: docs/otel-cost.md.
 
 ```bash
 # cost report + local thresholds (OSS); OSS 1 retry; exponential backoff / queues / key rotation / timestamp replay = paid later
@@ -123,7 +125,7 @@ node src/cli.js serve --port 8792 --in examples/spans.json
 # GET /v1/spans        recent summaries {ok, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]} (no prompts/secrets; cap 100 newest)
 # GET /v1/tenants      per-tenant spend {ok, count, tenants:[{id, spanCount, usd}]} (missing → `_`; optional budgetUsd; cap 100)
 # GET /openapi.json    file-backed OpenAPI 3 (openapi/cost.openapi.json)
-# GET /metrics         Prometheus text (otel_ai_cost_total_usd, otel_ai_cost_by_model_usd{model}, otel_ai_cost_span_count)
+# GET /metrics         Prometheus text (total / by-model / by-tenant / budget remaining / deny / tokens / span-count)
 # POST /v1/traces      OTLP JSON ingest (also POST /v1/otlp/v1/traces); merge into snapshot; default no auth
 # portfolio stack: make stack-demo (port 8792; default deny CORS so curls unchanged)
 ```
@@ -170,7 +172,7 @@ Finance CSV reuses those daily-by-model+tenant totals (no second price table): c
 | `GET /v1/spans` | Recent ingested/file-loaded span **summaries**: `{ok:true, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]}`. Allowlist only — **never** prompt/completion/input/output text, API keys, or Authorization. Newest first. Cap **100**; `count` is the full retained ring size; `truncated: true` when more. Empty → **200** `{ok:true, count:0, spans:[]}`. CORS + `X-Request-Id`. |
 | `GET /v1/tenants` | Per-tenant **spend** rollup: `{ok:true, count, tenants:[{id, spanCount, usd}]}`. Missing/empty → `_`. Sort highest usd first, then id. Cap **100**; `count` is the full tenant count; `truncated: true` when more. Optional `budgetUsd` when a tenant budget is configured. Optional `?tenant=`. Empty → **200** `{ok:true, count:0, tenants:[]}`. Never prompts/secrets. CORS + `X-Request-Id`. |
 | `GET /openapi.json` | File-backed OpenAPI 3 (`openapi/cost.openapi.json`) |
-| `GET /metrics` | Prometheus text: gauges `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`; counter `otel_ai_cost_span_count` |
+| `GET /metrics` | Prometheus text: gauges `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_by_tenant_usd{tenant}`, `otel_ai_cost_budget_remaining_usd{tenant}`, `otel_ai_cost_input_tokens`, `otel_ai_cost_output_tokens`; counters `otel_ai_cost_span_count`, `otel_ai_cost_budget_deny_total` |
 | `POST /v1/traces` | OTLP JSON ingest (alias `POST /v1/otlp/v1/traces`). Simplified `resourceSpans[].scopeSpans[].spans[]` or flat `{spans:[]}`. **200** `{ok:true, accepted}` (`accepted` = parsed count, not how many fit the cap). Bad JSON **400**. Empty **200** `accepted:0`. Optional Bearer when `--ingest-token` / `INGEST_TOKEN` set (**401** otherwise). Body > 1 MiB **413**. Rate-limited. Over `--span-max` drop oldest. |
 
 `GET /openapi.json` serves the file-backed OpenAPI 3 document ([`openapi/cost.openapi.json`](./openapi/cost.openapi.json)): `/health`, **`/ready`** (`getReady`), `/`, `/report.json`, **`/v1/costs.csv`** (`getCostsCsv`), **`/v1/costs.md`** (`getCostsMd`), **`/v1/costs.gha.txt`** (`getCostsGha`), **`/v1/costs`** (`getCosts`, `?format=`), **`/v1/budgets`** (`getBudgets`), **`/v1/models`** (`getModels`), **`/v1/config`** (`getConfig`; redacted knobs; no secrets), **`/v1/spans`** (`listSpans`; allowlist summaries; no prompts/secrets; cap 100 newest), **`/v1/tenants`** (`listTenants`; `{id, spanCount, usd}`), `/metrics`, **`POST /v1/traces`** (`postTraces`), plus `X-Request-Id` and **403** CORS notes. Portfolio dogfood: `make dogfood-a-e` (A generates TS/Python/Go clients under `sdk/generated/`, gitignored).
@@ -216,6 +218,18 @@ Container (k8s placeholder; images not published; skip if no Docker): `docker bu
 
 `report --budget … --webhook-url URL` or env `OTEL_AI_COST_WEBHOOK_URL`. When thresholds are exceeded, fire-and-forget POST JSON `{ok:false, breaches, totalUsd}` (short timeout ~750ms; webhook errors **never change** the exit code — still **exit 1** on breach). **Per-tenant breaches** reuse this helper: body includes `tenant` (and `breaches[].tenant`); HMAC still signs the raw body; **do not send tokens**. Missing tenant budgets → no extra webhook. Global `--budget` POST is unchanged (3 keys when no `tenant`). **Do not POST on pass.** Empty/omit = disabled. CLI `--webhook-url` wins over env (including empty to disable). Optional **HMAC (OSS):** `--webhook-secret` or env `OTEL_AI_COST_WEBHOOK_SECRET`. When set, POST includes `X-Webhook-Signature: sha256=<hex>` — HMAC-SHA256 of the **raw JSON body**. Omit / empty secret → unsigned (existing prove). **Every** outbound POST also sends `X-Webhook-Timestamp: <unix-seconds>` (HMAC still body-only). On **5xx** or **network/timeout**, retry the POST **once** after ~50ms (success on first try = no retry; **4xx do not retry**). Simple HMAC + **1 retry** is OSS. local-mvp mock receiver (`mock-webhook-receiver.js`) writes the last body (optional `--secret` verifies HMAC; `--headers-out` persists signature + timestamp); unsigned prove stays and asserts timestamp present/roughly now; isolated signed receiver asserts header + HMAC (body) + timestamp. Smoke unit-tests 200/4xx = no retry and 5xx/network = one retry. **Exponential backoff / queues, key rotation / timestamp replay window enforcement = paid later**.
 
----
+### Tenant / budget Prometheus + Grafana
 
-Part of the [oss-cash-lab](https://github.com/wozqhl/oss-cash-lab) portfolio.
+`GET /metrics` also exposes per-tenant spend, budget remaining, a budget-deny counter, and token totals. Names follow the existing `otel_ai_cost_*` prefix. Remaining may be negative when over budget.
+
+Once a tenant is already over `--tenant-budget`, further ingest for that tenant is not stored; the JSON includes `denied` (HTTP 200; `accepted` stays parsed count).
+
+Dedicated dashboard (importable, no live Grafana): [`deploy/grafana/e-otel-ai-cost.json`](../../deploy/grafana/e-otel-ai-cost.json). Shared `oss-cash-lab.json` already has E Total USD / Cost by model; this stream does not edit it.
+
+Local OTLP demo (no Docker): `scripts/otlp-demo.sh`.
+
+### Positioning vs Helicone / Langfuse
+
+Honest, no fake stats: Helicone went maintenance after the Mintlify acquisition (Mar 2026). Langfuse was acquired by ClickHouse (Jan 2026). OpenTelemetry graduated CNCF (May 2026).
+
+This tool is an OTel-native tenant spend + budget deny plane, not a hosted LLM observability SaaS. See [docs/otel-cost.md](./docs/otel-cost.md). Collector contrib draft (not filed): [docs/collector-contrib-issue.md](./docs/collector-contrib-issue.md).

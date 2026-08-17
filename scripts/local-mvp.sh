@@ -697,6 +697,11 @@ test -s out/serve-metrics.txt
 grep -q 'otel_ai_cost_total_usd' out/serve-metrics.txt
 grep -q 'otel_ai_cost_by_model_usd' out/serve-metrics.txt
 grep -q 'otel_ai_cost_span_count' out/serve-metrics.txt
+grep -q 'otel_ai_cost_by_tenant_usd' out/serve-metrics.txt
+grep -q 'otel_ai_cost_budget_remaining_usd' out/serve-metrics.txt
+grep -q 'otel_ai_cost_budget_deny_total' out/serve-metrics.txt
+grep -q 'otel_ai_cost_input_tokens' out/serve-metrics.txt
+grep -q 'otel_ai_cost_output_tokens' out/serve-metrics.txt
 echo "metrics_names_ok"
 
 echo "==> GET /openapi.json (file-backed spec)"
@@ -1516,4 +1521,7 @@ CFG_ISO_PID=""
 trap - EXIT
 echo "==> [config] isolated webhook not leaked OK"
 
-echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax)"
+echo "==> [otlp-demo] local OTLP ingest + tenant/budget metrics"
+OTLP_DEMO_PORT="${OTLP_DEMO_PORT:-8841}" bash "$ROOT/scripts/otlp-demo.sh"
+
+echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+otlpDemo)"

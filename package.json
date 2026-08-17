@@ -11,6 +11,7 @@
     "start": "node src/cli.js",
     "smoke": "node src/cli.js smoke",
     "local-mvp": "bash scripts/local-mvp.sh",
+    "otlp-demo": "bash scripts/otlp-demo.sh",
     "version": "node src/cli.js --version"
   },
   "engines": {
