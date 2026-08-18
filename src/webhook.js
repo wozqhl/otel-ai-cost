@@ -2,7 +2,7 @@
  *
  * OSS: best-effort POST when report --budget / check-budget exceeds limits,
  * or when HTTP ingest denies a span because the tenant is already over budget
- * (once per denied request).
+ * or the incoming cost would exceed it (once per denied request).
  * Optional simple HMAC-SHA256 (`--webhook-secret` / OTEL_AI_COST_WEBHOOK_SECRET)
  * → `X-Webhook-Signature: sha256=<hex>` of the raw JSON body.
  * Always sends `X-Webhook-Timestamp: <unix-seconds>` (HMAC still body-only).

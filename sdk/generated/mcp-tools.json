@@ -1,0 +1,285 @@
+{
+  "tools": [
+    {
+      "name": "getHealth",
+      "description": "Health check",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getReady",
+      "description": "Readiness (503 while shutting down)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getIndex",
+      "description": "HTML cost report",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getReport",
+      "description": "Structured cost report JSON",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getCostsCsv",
+      "description": "Finance CSV cost export",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getCostsMd",
+      "description": "FinOps Markdown cost report",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getCostsGha",
+      "description": "GitHub Actions annotations alias (same as GET /v1/costs?format=gha)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getCosts",
+      "description": "Cost snapshot (json | csv | md | gha)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "json",
+              "csv",
+              "md",
+              "gha"
+            ],
+            "default": "json",
+            "example": "csv"
+          }
+        }
+      }
+    },
+    {
+      "name": "getBudgets",
+      "description": "Configured budget thresholds (not spend)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getModels",
+      "description": "Pricing catalog (rates, not spend)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "listSpans",
+      "description": "Recent span summaries (FinOps debug)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "listTenants",
+      "description": "Per-tenant cost rollup (actual spend)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          },
+          "tenant": {
+            "type": "string",
+            "example": "acme"
+          }
+        }
+      }
+    },
+    {
+      "name": "postTraces",
+      "description": "Ingest OTLP JSON traces",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          },
+          "resourceSpans": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "spans": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "postTracesAlias",
+      "description": "Ingest OTLP JSON traces (alias)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          },
+          "resourceSpans": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "spans": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "getMetrics",
+      "description": "Prometheus metrics",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getOpenApi",
+      "description": "OpenAPI 3 document",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    },
+    {
+      "name": "getConfig",
+      "description": "Redacted runtime config",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "X-Request-Id": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "mvp-req-id-a1b2c3d4"
+          }
+        }
+      }
+    }
+  ]
+}

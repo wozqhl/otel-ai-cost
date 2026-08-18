@@ -21,7 +21,7 @@ FinOps pipelines therefore re-price in a sidecar (this repo: otel-ai-cost) or in
 | `gen_ai.cost.budget_usd` | double | Optional remaining or configured tenant budget (processor config, not a secret). |
 | `gen_ai.cost.tenant` | string | Optional copy of `tenant` / `gen_ai.cost.tenant` for processors that cannot read arbitrary keys. |
 
-This repo already reads `tenant`, `gen_ai.request.model`, and usage tokens. It **emits** Prometheus `otel_ai_cost_*` series; it does **not** write cost attributes back onto spans today. If contrib adopted `gen_ai.cost.usd`, this service would accept it as an override and stop re-pricing when present (honest: not implemented yet).
+This repo already reads `tenant`, `gen_ai.request.model`, and usage tokens. It **emits** Prometheus `otel_ai_cost_*` series; it does **not** write cost attributes back onto spans today. **If present**, a finite `gen_ai.cost.usd` ≥ 0 is accepted as that span's incoming cost (report, would-exceed deny, webhook); missing/invalid keeps token × price. This is an "if present" override — not a claim that OTel has shipped the attribute.
 
 ## Non-goals
 

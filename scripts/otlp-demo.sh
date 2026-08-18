@@ -16,7 +16,7 @@ printf "%s\n" "[]" > "$SPANS"
 unset OTEL_AI_COST_CORS_ORIGINS || true
 unset INGEST_TOKEN || true
 unset RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM || true
-unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS DENY_ON_WOULD_EXCEED || true
 
 node src/cli.js serve --port "$PORT" --in "$SPANS" \
   --tenant-budget "acme=0.01,other=5" >"$LOG" 2>&1 &
@@ -53,7 +53,7 @@ grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' out/otlp-demo-cheap.json
 grep -Eq '"accepted"[[:space:]]*:[[:space:]]*1' out/otlp-demo-cheap.json
 grep -Eq '"denied"[[:space:]]*:[[:space:]]*0' out/otlp-demo-cheap.json
 
-echo "==> [otlp-demo] POST other-tenant + expensive acme (pushes acme over 0.01)"
+echo "==> [otlp-demo] POST other-tenant + expensive acme (would exceed 0.01 → deny, spend unchanged)"
 OTHER="$(curl -s -o out/otlp-demo-other.json -w "%{http_code}" \
   -X POST "http://127.0.0.1:$PORT/v1/traces" \
   -H "Content-Type: application/json" \
@@ -67,12 +67,13 @@ OVER="$(curl -s -o out/otlp-demo-over.json -w "%{http_code}" \
 echo "over_status=$OVER body=$(cat out/otlp-demo-over.json)"
 test "$OVER" = "200"
 grep -Eq '"accepted"[[:space:]]*:[[:space:]]*1' out/otlp-demo-over.json
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/otlp-demo-over.json
 
-echo "==> [otlp-demo] POST another acme span (already over budget → deny)"
+echo "==> [otlp-demo] POST another expensive acme span (would still exceed → deny)"
 DENY="$(curl -s -o out/otlp-demo-deny.json -w "%{http_code}" \
   -X POST "http://127.0.0.1:$PORT/v1/traces" \
   -H "Content-Type: application/json" \
-  -d '{"spans":[{"timestamp":"2024-08-16T03:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":50,"tenant":"acme"}}]}')"
+  -d '{"spans":[{"timestamp":"2024-08-16T03:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o","gen_ai.usage.input_tokens":2000,"gen_ai.usage.output_tokens":800,"tenant":"acme"}}]}')"
 echo "deny_status=$DENY body=$(cat out/otlp-demo-deny.json)"
 test "$DENY" = "200"
 grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/otlp-demo-deny.json
@@ -87,7 +88,7 @@ const d=require("./out/otlp-demo-tenants.json");
 if(d.ok!==true || !Array.isArray(d.tenants) || d.tenants.length<2) { console.error(d); process.exit(1); }
 const acme=d.tenants.find((t)=>t.id==="acme");
 const other=d.tenants.find((t)=>t.id==="other");
-if(!acme || !(Number(acme.usd)>0.01) || Number(acme.budgetUsd)!==0.01) { console.error("acme spend/budget", acme); process.exit(1); }
+if(!acme || !(Number(acme.usd)>0) || !(Number(acme.usd)<0.01) || Number(acme.budgetUsd)!==0.01) { console.error("acme spend must stay under budget after would-exceed deny", acme); process.exit(1); }
 if(!other || Number(other.budgetUsd)!==5) { console.error("other budget", other); process.exit(1); }
 console.log("tenants_ok", {count:d.count, acmeUsd:acme.usd, otherUsd:other.usd});
 '
@@ -98,7 +99,8 @@ SPANS_CODE="$(curl -s -o out/otlp-demo-spans-out.json -w "%{http_code}" \
 test "$SPANS_CODE" = "200"
 node -e '
 const d=require("./out/otlp-demo-spans-out.json");
-if(d.ok!==true || !Array.isArray(d.spans) || Number(d.count)<3) { console.error(d); process.exit(1); }
+if(d.ok!==true || !Array.isArray(d.spans) || Number(d.count)<2) { console.error(d); process.exit(1); }
+if(d.spans.some((x)=>x.model==="gpt-4o" && x.tenant==="acme")) { console.error("denied expensive acme span must not be stored", d); process.exit(1); }
 const blob=JSON.stringify(d);
 if(blob.includes("gen_ai.prompt") || blob.includes("SECRET")) { console.error("spans leaked", d); process.exit(1); }
 console.log("spans_ok", {count:d.count, models:[...new Set(d.spans.map((s)=>s.model))]});

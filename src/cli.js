@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 import {
   report,
   DEFAULT_PRICES,
+  spanCost,
+  spanCostUsdAttr,
+  COST_USD_ATTR,
   formatTable,
   formatHtml,
   formatCsv,
@@ -22,11 +25,21 @@ import {
   tenantBudgetWebhookCheck,
   ingestDenyWebhookCheck,
   applyBudgetDeny,
+  resolveDenyOnWouldExceed,
+  ENV_DENY_ON_WOULD_EXCEED,
+  resolveBudgetPeriod,
+  ENV_BUDGET_PERIOD,
+  ENV_BUDGET_PERIOD_ALIAS,
+  BUDGET_PERIOD_DAY,
+  utcToday,
+  wouldExceedBudget,
   tenantBudgetRemaining,
   budgetsJson,
   modelsJson,
   spansJson,
   tenantsJson,
+  formatTenantsCsv,
+  TENANT_CSV_COLUMNS,
   SPAN_LIST_CAP,
   TENANT_LIST_CAP,
   ENV_TENANT_BUDGETS,
@@ -146,7 +159,7 @@ Usage:
   otel-ai-cost serve --in spans.json [--port 8792] [--host 127.0.0.1] [--group-by day]
                      [--tenant-budget acme=10,other=5] [--cors-origins CSV] [--rate-limit N]
                      [--ingest-token TOKEN] [--span-max 50000] [--webhook-url URL] [--webhook-secret SECRET]
-                     [--watch] [--drain-ms 5000] [--log-json]
+                     [--no-deny-on-would-exceed] [--budget-period day] [--watch] [--drain-ms 5000] [--log-json]
 `);
 }
 
@@ -180,6 +193,9 @@ function parseArgs(argv) {
     else if (a === "--tenant-budget") out.tenantBudget = argv[++i] ?? "";
     else if (a === "--ingest-token") out.ingestToken = argv[++i] ?? "";
     else if (a === "--span-max") out.spanMax = argv[++i];
+    else if (a === "--deny-on-would-exceed") out.denyOnWouldExceed = true;
+    else if (a === "--no-deny-on-would-exceed") out.denyOnWouldExceed = false;
+    else if (a === "--budget-period") out.budgetPeriod = argv[++i] ?? "";
     else out._.push(a);
   }
   return out;
@@ -585,6 +601,38 @@ if (cmd === "--version" || cmd === "-V") {
     });
     process.exit(1);
   }
+  const emptyTenantCsv = formatTenantsCsv([]);
+  const twoTenantCsv = formatTenantsCsv(
+    [
+      {
+        attributes: {
+          "gen_ai.request.model": "gpt-4o-mini",
+          tenant: "acme",
+          "gen_ai.cost.usd": 1,
+        },
+      },
+      {
+        attributes: {
+          "gen_ai.request.model": "gpt-4o-mini",
+          tenant: "other",
+          "gen_ai.cost.usd": 2,
+        },
+      },
+    ],
+    { budgets: { acme: 10, other: 5 }, denyByTenant: { acme: 1 } }
+  );
+  const twoCsvLines = twoTenantCsv.trim().split("\n");
+  const tenantCsvHelperOk =
+    TENANT_CSV_COLUMNS.join(",") === "tenant,spend_usd,budget_usd,remaining_usd,denied_count" &&
+    emptyTenantCsv === "tenant,spend_usd,budget_usd,remaining_usd,denied_count\n" &&
+    twoCsvLines[0] === "tenant,spend_usd,budget_usd,remaining_usd,denied_count" &&
+    twoCsvLines.length === 3 &&
+    twoCsvLines.some((l) => l.startsWith("other,2.000000,5.000000,3.000000,0")) &&
+    twoCsvLines.some((l) => l.startsWith("acme,1.000000,10.000000,9.000000,1"));
+  if (!tenantCsvHelperOk) {
+    console.error("smoke failed formatTenantsCsv helper", { emptyTenantCsv, twoTenantCsv });
+    process.exit(1);
+  }
   const cfgPayload = summarizeRuntimeConfig({
     spanMax: 50000,
     rateLimit: 120,
@@ -874,6 +922,228 @@ if (cmd === "--version" || cmd === "-V") {
     console.error("smoke ingestDenyWebhookCheck no-deny should be ok", denySkip);
     process.exit(1);
   }
+  const underSpan = {
+    timestamp: "2024-08-18T00:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 0,
+      tenant: "acme",
+    },
+  };
+  const incomingCross = {
+    timestamp: "2024-08-18T01:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 0,
+      tenant: "acme",
+      "gen_ai.prompt": "SECRET_PROMPT_WOULD_EXCEED",
+    },
+  };
+  const underReport = report([underSpan], DEFAULT_PRICES, { tenantBudgets: { acme: 0.0002 } });
+  const underUsd = Number((underReport.byTenant || []).find((t) => t.tenant === "acme")?.usd);
+  if (!(underUsd > 0) || !(underUsd < 0.0002)) {
+    console.error("smoke would-exceed fixture must be just under budget", underReport.byTenant);
+    process.exit(1);
+  }
+  if (!wouldExceedBudget(underUsd, 0.00015, 0.0002) || wouldExceedBudget(underUsd, 0.00015, 0.0003)) {
+    console.error("smoke wouldExceedBudget exact/over failed", { underUsd });
+    process.exit(1);
+  }
+  const wouldHit = applyBudgetDeny([incomingCross], underReport, { acme: 0.0002 });
+  if (wouldHit.denied !== 1 || wouldHit.kept.length !== 0) {
+    console.error("smoke applyBudgetDeny would-exceed should deny", wouldHit, underReport);
+    process.exit(1);
+  }
+  const exactHit = applyBudgetDeny([incomingCross], underReport, { acme: 0.0003 });
+  if (exactHit.denied !== 0 || exactHit.kept.length !== 1) {
+    console.error("smoke applyBudgetDeny exact-on-budget should allow", exactHit, underReport);
+    process.exit(1);
+  }
+  const oldWould = applyBudgetDeny([incomingCross], underReport, { acme: 0.0002 }, { denyOnWouldExceed: false });
+  if (oldWould.denied !== 0 || oldWould.kept.length !== 1) {
+    console.error("smoke applyBudgetDeny DENY_ON_WOULD_EXCEED=false should allow until already over", oldWould);
+    process.exit(1);
+  }
+  const wouldFlagOk =
+    ENV_DENY_ON_WOULD_EXCEED === "DENY_ON_WOULD_EXCEED" &&
+    resolveDenyOnWouldExceed(null, {}) === true &&
+    resolveDenyOnWouldExceed(null, { [ENV_DENY_ON_WOULD_EXCEED]: "false" }) === false &&
+    resolveDenyOnWouldExceed(null, { [ENV_DENY_ON_WOULD_EXCEED]: "0" }) === false &&
+    resolveDenyOnWouldExceed(false, { [ENV_DENY_ON_WOULD_EXCEED]: "true" }) === false &&
+    resolveDenyOnWouldExceed(true, { [ENV_DENY_ON_WOULD_EXCEED]: "false" }) === true;
+  if (!wouldFlagOk) {
+    console.error("smoke resolveDenyOnWouldExceed failed");
+    process.exit(1);
+  }
+  const wouldCheck = ingestDenyWebhookCheck(wouldHit, underReport, { acme: 0.0002 });
+  const wouldPayload = buildWebhookPayload(wouldCheck);
+  const wouldBlob = JSON.stringify(wouldPayload);
+  if (
+    wouldCheck.ok !== false ||
+    wouldCheck.tenant !== "acme" ||
+    Number(wouldCheck.denied) !== 1 ||
+    Number(wouldCheck.spend) !== underUsd ||
+    Number(wouldCheck.budget) !== 0.0002 ||
+    Number(wouldPayload.denied) !== 1 ||
+    wouldBlob.includes("SECRET_PROMPT_WOULD_EXCEED") ||
+    wouldBlob.includes("gen_ai.prompt")
+  ) {
+    console.error("smoke would-exceed webhook check leaked or mismatched", wouldCheck, wouldPayload);
+    process.exit(1);
+  }
+
+  const tokenMathUsd = spanCost({
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 0,
+    },
+  }).usd;
+  const attrSpan = {
+    timestamp: "2024-08-18T00:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 0,
+      [COST_USD_ATTR]: 1.23,
+      tenant: "acme",
+    },
+  };
+  const attrCost = spanCost(attrSpan);
+  if (
+    COST_USD_ATTR !== "gen_ai.cost.usd" ||
+    spanCostUsdAttr(attrSpan) !== 1.23 ||
+    attrCost.usd !== 1.23 ||
+    attrCost.usd === tokenMathUsd ||
+    Number(tokenMathUsd) !== 0.00015
+  ) {
+    console.error("smoke gen_ai.cost.usd must win over token×price", { attrCost, tokenMathUsd });
+    process.exit(1);
+  }
+  const attrReport = report([attrSpan], DEFAULT_PRICES);
+  if (Number(attrReport.totalUsd) !== 1.23) {
+    console.error("smoke report spend must match gen_ai.cost.usd", attrReport);
+    process.exit(1);
+  }
+  const fallbackCases = [undefined, null, "", "nope", -1, Infinity, NaN, true, { doubleValue: 1.23 }];
+  for (const bad of fallbackCases) {
+    const span = {
+      attributes: {
+        "gen_ai.request.model": "gpt-4o-mini",
+        "gen_ai.usage.input_tokens": 1000,
+        "gen_ai.usage.output_tokens": 0,
+      },
+    };
+    if (bad !== undefined) span.attributes[COST_USD_ATTR] = bad;
+    const got = spanCost(span).usd;
+    if (got !== tokenMathUsd) {
+      console.error("smoke invalid gen_ai.cost.usd must fall back to token×price", { bad, got, tokenMathUsd });
+      process.exit(1);
+    }
+  }
+  const zeroCost = spanCost({
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 0,
+      [COST_USD_ATTR]: 0,
+    },
+  });
+  if (zeroCost.usd !== 0) {
+    console.error("smoke gen_ai.cost.usd=0 must be used", zeroCost);
+    process.exit(1);
+  }
+  const otlpExtracted = extractIngestSpans({
+    resourceSpans: [
+      {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                timestamp: "2024-08-18T00:00:00.000Z",
+                attributes: [
+                  { key: "gen_ai.request.model", value: { stringValue: "gpt-4o-mini" } },
+                  { key: "gen_ai.usage.input_tokens", value: { intValue: 1000 } },
+                  { key: "gen_ai.usage.output_tokens", value: { intValue: 0 } },
+                  { key: COST_USD_ATTR, value: { doubleValue: 1.23 } },
+                  { key: "tenant", value: { stringValue: "acme" } },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  if (!otlpExtracted.length || spanCost(otlpExtracted[0]).usd !== 1.23) {
+    console.error("smoke OTLP doubleValue gen_ai.cost.usd failed", otlpExtracted);
+    process.exit(1);
+  }
+  const seedAttr = {
+    timestamp: "2024-08-18T00:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1,
+      "gen_ai.usage.output_tokens": 0,
+      [COST_USD_ATTR]: 0.4,
+      tenant: "acme",
+    },
+  };
+  const incomingAttr = {
+    timestamp: "2024-08-18T01:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1,
+      "gen_ai.usage.output_tokens": 0,
+      [COST_USD_ATTR]: 0.2,
+      tenant: "acme",
+      "gen_ai.prompt": "SECRET_PROMPT_COST_ATTR",
+    },
+  };
+  const seedAttrReport = report([seedAttr], DEFAULT_PRICES, { tenantBudgets: { acme: 0.5 } });
+  const seedAttrUsd = Number((seedAttrReport.byTenant || []).find((t) => t.tenant === "acme")?.usd);
+  if (seedAttrUsd !== 0.4) {
+    console.error("smoke attr seed spend must be 0.4 not token math", seedAttrReport);
+    process.exit(1);
+  }
+  const attrWould = applyBudgetDeny([incomingAttr], seedAttrReport, { acme: 0.5 });
+  if (attrWould.denied !== 1 || attrWould.kept.length !== 0) {
+    console.error("smoke would-exceed must use gen_ai.cost.usd incoming", attrWould, seedAttrReport);
+    process.exit(1);
+  }
+  const incomingTokOnly = {
+    timestamp: "2024-08-18T01:00:00.000Z",
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.usage.input_tokens": 1,
+      "gen_ai.usage.output_tokens": 0,
+      tenant: "acme",
+    },
+  };
+  const tokWould = applyBudgetDeny([incomingTokOnly], seedAttrReport, { acme: 0.5 });
+  if (tokWould.denied !== 0 || tokWould.kept.length !== 1) {
+    console.error("smoke token-only incoming should stay under 0.5", tokWould);
+    process.exit(1);
+  }
+  const attrDenyCheck = ingestDenyWebhookCheck(attrWould, seedAttrReport, { acme: 0.5 });
+  const attrDenyPayload = buildWebhookPayload(attrDenyCheck);
+  const attrDenyBlob = JSON.stringify(attrDenyPayload);
+  if (
+    attrDenyCheck.ok !== false ||
+    attrDenyCheck.tenant !== "acme" ||
+    Number(attrDenyCheck.spend) !== 0.4 ||
+    Number(attrDenyCheck.budget) !== 0.5 ||
+    Number(attrDenyCheck.denied) !== 1 ||
+    Number(attrDenyPayload.spend) !== 0.4 ||
+    attrDenyBlob.includes("SECRET_PROMPT_COST_ATTR") ||
+    attrDenyBlob.includes("gen_ai.prompt")
+  ) {
+    console.error("smoke webhook spend must use gen_ai.cost.usd", attrDenyCheck, attrDenyPayload);
+    process.exit(1);
+  }
+
   const hookOk =
     resolveWebhookUrl(null, {}) == null &&
     resolveWebhookUrl(null, { [ENV_WEBHOOK_URL]: "http://127.0.0.1:9/hook" }) ===
@@ -1095,6 +1365,7 @@ if (cmd === "--version" || cmd === "-V") {
     skipRateLimit("/v1/config") ||
     skipRateLimit("/v1/spans") ||
     skipRateLimit("/v1/tenants") ||
+    skipRateLimit("/v1/tenants.csv") ||
     skipRateLimit("/") ||
     skipRateLimit("/v1/traces") ||
     skipRateLimit("/v1/otlp/v1/traces")
@@ -1236,6 +1507,7 @@ if (cmd === "--version" || cmd === "-V") {
     !shouldSkipAccessLog("GET", "/v1/config") &&
     !shouldSkipAccessLog("GET", "/v1/spans") &&
     !shouldSkipAccessLog("GET", "/v1/tenants") &&
+    !shouldSkipAccessLog("GET", "/v1/tenants.csv") &&
     !shouldSkipAccessLog("POST", "/v1/traces") &&
     resolveLogJson(undefined, {}) === false &&
     resolveLogJson(undefined, { LOG_FORMAT: "json" }) === true &&
@@ -1255,7 +1527,7 @@ if (cmd === "--version" || cmd === "-V") {
     process.exit(1);
   }
   const specPaths = spec.paths || {};
-  const specNeed = ["/health", "/ready", "/", "/report.json", "/v1/costs.csv", "/v1/costs.md", "/v1/costs.gha.txt", "/v1/costs", "/v1/budgets", "/v1/models", "/v1/config", "/v1/spans", "/v1/tenants", "/metrics", "/openapi.json"];
+  const specNeed = ["/health", "/ready", "/", "/report.json", "/v1/costs.csv", "/v1/costs.md", "/v1/costs.gha.txt", "/v1/costs", "/v1/budgets", "/v1/models", "/v1/config", "/v1/spans", "/v1/tenants", "/v1/tenants.csv", "/metrics", "/openapi.json"];
   const specMissing = specNeed.filter((p) => !specPaths[p] || !specPaths[p].get);
   const specDesc = String((spec.info || {}).description || "");
   const specParams = (spec.components || {}).parameters || {};
@@ -1305,10 +1577,15 @@ if (cmd === "--version" || cmd === "-V") {
     Boolean((((specPaths["/v1/tenants"] || {}).get || {}).responses || {})["200"]) &&
     Boolean((((specPaths["/v1/tenants"] || {}).get || {}).responses || {})["403"]) &&
     Boolean((((specPaths["/v1/tenants"] || {}).get || {}).responses || {})["429"]) &&
+    ((specPaths["/v1/tenants.csv"] || {}).get || {}).operationId === "getTenantsCsv" &&
+    Boolean((((specPaths["/v1/tenants.csv"] || {}).get || {}).responses || {})["200"]) &&
+    Boolean((((specPaths["/v1/tenants.csv"] || {}).get || {}).responses || {})["403"]) &&
+    Boolean((((specPaths["/v1/tenants.csv"] || {}).get || {}).responses || {})["429"]) &&
     JSON.stringify((spec.components || {}).schemas?.TenantList || {}).includes("truncated") &&
     JSON.stringify((spec.components || {}).schemas?.TenantSpend || {}).includes("spanCount") &&
     JSON.stringify((spec.components || {}).schemas?.TenantSpend || {}).includes("budgetUsd") &&
     (specDesc.includes("/v1/tenants") || specDesc.includes("listTenants") || specDesc.includes("tenant inventory")) &&
+    (specDesc.includes("/v1/tenants.csv") || specDesc.includes("getTenantsCsv") || specDesc.includes("spend_usd")) &&
     (specDesc.includes("/v1/costs.md") || specDesc.includes("text/markdown") || specDesc.includes("format=md")) &&
     (specDesc.includes("/v1/costs.gha.txt") || specDesc.includes("format=gha") || specDesc.includes("::error")) &&
     ((specPaths["/metrics"] || {}).get || {}).operationId === "getMetrics" &&
@@ -2025,6 +2302,16 @@ if (cmd === "--version" || cmd === "-V") {
       console.error("smoke empty /v1/tenants failed", emptyTenantsRes.status, emptyTenants);
       process.exit(1);
     }
+    const emptyTenantsCsvRes = await fetch(`http://127.0.0.1:${emptyAddr.port}/v1/tenants.csv`);
+    const emptyTenantsCsv = await emptyTenantsCsvRes.text();
+    if (
+      emptyTenantsCsvRes.status !== 200 ||
+      !String(emptyTenantsCsvRes.headers.get("content-type") || "").includes("text/csv") ||
+      emptyTenantsCsv !== "tenant,spend_usd,budget_usd,remaining_usd,denied_count\n"
+    ) {
+      console.error("smoke empty /v1/tenants.csv failed", emptyTenantsCsvRes.status, emptyTenantsCsv);
+      process.exit(1);
+    }
   } finally {
     await closeServer(emptyServed.server);
   }
@@ -2640,6 +2927,192 @@ if (cmd === "--version" || cmd === "-V") {
     await closeServer(ingestHookMock);
   }
 
+  const wouldHookReceived = [];
+  const wouldHookMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      wouldHookReceived.push({
+        method: req.method,
+        url: req.url,
+        headers: { ...req.headers },
+        raw: Buffer.concat(chunks).toString("utf8"),
+      });
+      const ack = JSON.stringify({ ok: true });
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": Buffer.byteLength(ack),
+      });
+      res.end(ack);
+    });
+  });
+  const wouldHookMockAddr = await listen(wouldHookMock, 0, "127.0.0.1");
+  const wouldHookServed = createReportServer({
+    spans: [underSpan],
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: { acme: 0.0002 },
+    webhookUrl: `http://127.0.0.1:${wouldHookMockAddr.port}/hook`,
+    denyOnWouldExceed: true,
+  });
+  const wouldHookAddr = await listen(wouldHookServed.server, 0, "127.0.0.1");
+  try {
+    const spendBefore = Number(
+      (wouldHookServed.report.byTenant || []).find((t) => t.tenant === "acme")?.usd
+    );
+    const wouldHttp = await fetch(`http://127.0.0.1:${wouldHookAddr.port}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [incomingCross] }),
+    });
+    const wouldHttpBody = await wouldHttp.json();
+    const spendAfter = Number(
+      (wouldHookServed.report.byTenant || []).find((t) => t.tenant === "acme")?.usd
+    );
+    if (
+      wouldHttp.status !== 200 ||
+      wouldHttpBody.ok !== true ||
+      wouldHttpBody.accepted !== 1 ||
+      wouldHttpBody.denied !== 1 ||
+      spendAfter !== spendBefore ||
+      wouldHookReceived.length !== 1
+    ) {
+      console.error("smoke would-exceed HTTP deny failed", {
+        status: wouldHttp.status,
+        wouldHttpBody,
+        spendBefore,
+        spendAfter,
+        hooks: wouldHookReceived.length,
+      });
+      process.exit(1);
+    }
+    let wouldHookBody;
+    try {
+      wouldHookBody = JSON.parse(wouldHookReceived[0].raw);
+    } catch {
+      wouldHookBody = null;
+    }
+    const wouldRaw = wouldHookReceived[0].raw;
+    if (
+      !wouldHookBody ||
+      wouldHookBody.ok !== false ||
+      wouldHookBody.tenant !== "acme" ||
+      Number(wouldHookBody.denied) !== 1 ||
+      Number(wouldHookBody.spend) !== spendBefore ||
+      Number(wouldHookBody.budget) !== 0.0002 ||
+      wouldRaw.includes("SECRET_PROMPT_WOULD_EXCEED") ||
+      wouldRaw.includes("gen_ai.prompt")
+    ) {
+      console.error("smoke would-exceed webhook payload failed", wouldHookBody);
+      process.exit(1);
+    }
+    console.log("would-exceed-ok");
+  } finally {
+    await closeServer(wouldHookServed.server);
+    await closeServer(wouldHookMock);
+  }
+
+  const attrHookReceived = [];
+  const attrHookMock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      attrHookReceived.push({
+        method: req.method,
+        url: req.url,
+        headers: { ...req.headers },
+        raw: Buffer.concat(chunks).toString("utf8"),
+      });
+      const ack = JSON.stringify({ ok: true });
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": Buffer.byteLength(ack),
+      });
+      res.end(ack);
+    });
+  });
+  const attrHookMockAddr = await listen(attrHookMock, 0, "127.0.0.1");
+  const attrHookServed = createReportServer({
+    spans: [seedAttr],
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: { acme: 0.5 },
+    webhookUrl: `http://127.0.0.1:${attrHookMockAddr.port}/hook`,
+    denyOnWouldExceed: true,
+  });
+  const attrHookAddr = await listen(attrHookServed.server, 0, "127.0.0.1");
+  try {
+    const attrSpendBefore = Number(
+      (attrHookServed.report.byTenant || []).find((t) => t.tenant === "acme")?.usd
+    );
+    if (attrSpendBefore !== 0.4) {
+      console.error("smoke gen_ai.cost.usd HTTP seed spend must be 0.4 not token math", {
+        attrSpendBefore,
+        report: attrHookServed.report,
+      });
+      process.exit(1);
+    }
+    const attrOne = createReportServer({ spans: [], groupBy: "day", version: VERSION });
+    const attrOneIn = attrOne.ingest([attrSpan]);
+    if (attrOneIn.denied !== 0 || Number(attrOne.report.totalUsd) !== 1.23) {
+      console.error("smoke one-span gen_ai.cost.usd spend must match attribute", {
+        attrOneIn,
+        totalUsd: attrOne.report.totalUsd,
+      });
+      process.exit(1);
+    }
+    const attrHttp = await fetch(`http://127.0.0.1:${attrHookAddr.port}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [incomingAttr] }),
+    });
+    const attrHttpBody = await attrHttp.json();
+    const attrSpendAfter = Number(
+      (attrHookServed.report.byTenant || []).find((t) => t.tenant === "acme")?.usd
+    );
+    if (
+      attrHttp.status !== 200 ||
+      attrHttpBody.ok !== true ||
+      attrHttpBody.accepted !== 1 ||
+      attrHttpBody.denied !== 1 ||
+      attrSpendAfter !== 0.4 ||
+      attrHookReceived.length !== 1
+    ) {
+      console.error("smoke gen_ai.cost.usd would-exceed HTTP deny failed", {
+        status: attrHttp.status,
+        attrHttpBody,
+        attrSpendBefore,
+        attrSpendAfter,
+        hooks: attrHookReceived.length,
+      });
+      process.exit(1);
+    }
+    let attrHookBody;
+    try {
+      attrHookBody = JSON.parse(attrHookReceived[0].raw);
+    } catch {
+      attrHookBody = null;
+    }
+    const attrHookRaw = attrHookReceived[0].raw;
+    if (
+      !attrHookBody ||
+      attrHookBody.ok !== false ||
+      attrHookBody.tenant !== "acme" ||
+      Number(attrHookBody.denied) !== 1 ||
+      Number(attrHookBody.spend) !== 0.4 ||
+      Number(attrHookBody.budget) !== 0.5 ||
+      attrHookRaw.includes("SECRET_PROMPT_COST_ATTR") ||
+      attrHookRaw.includes("gen_ai.prompt")
+    ) {
+      console.error("smoke gen_ai.cost.usd webhook payload failed", attrHookBody);
+      process.exit(1);
+    }
+    console.log("cost-attr-ok");
+  } finally {
+    await closeServer(attrHookServed.server);
+    await closeServer(attrHookMock);
+  }
+
   const spanMaxOk =
     DEFAULT_SPAN_MAX === 50000 &&
     ENV_SPAN_MAX === "SPAN_MAX" &&
@@ -2725,7 +3198,214 @@ if (cmd === "--version" || cmd === "-V") {
     process.exit(1);
   }
 
-  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook`);
+  const exportServed = createReportServer({
+    spans: [],
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: parseTenantBudgets("acme=10,other=5"),
+  });
+  const exportAddr = await listen(exportServed.server, 0, "127.0.0.1");
+  const exportBase = `http://127.0.0.1:${exportAddr.port}`;
+  try {
+    const exportPost = await fetch(`${exportBase}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        spans: [
+          {
+            timestamp: "2024-08-18T00:00:00.000Z",
+            attributes: {
+              "gen_ai.request.model": "gpt-4o-mini",
+              tenant: "acme",
+              "gen_ai.cost.usd": 1,
+            },
+          },
+          {
+            timestamp: "2024-08-18T00:00:01.000Z",
+            attributes: {
+              "gen_ai.request.model": "gpt-4o-mini",
+              tenant: "other",
+              "gen_ai.cost.usd": 2,
+            },
+          },
+        ],
+      }),
+    });
+    const exportPostBody = await exportPost.json();
+    if (exportPost.status !== 200 || exportPostBody.ok !== true || Number(exportPostBody.denied) !== 0) {
+      console.error("smoke export ingest two tenants failed", exportPost.status, exportPostBody);
+      process.exit(1);
+    }
+    const exportJsonRes = await fetch(`${exportBase}/v1/tenants`);
+    const exportJson = await exportJsonRes.json();
+    const exportCsvRes = await fetch(`${exportBase}/v1/tenants.csv`);
+    const exportCsv = await exportCsvRes.text();
+    const exportCsvAlias = await (await fetch(`${exportBase}/v1/tenants?format=csv`)).text();
+    const exportLines = exportCsv.trim().split("\n");
+    const exportIds = (exportJson.tenants || []).map((t) => t.id);
+    if (
+      exportJsonRes.status !== 200 ||
+      exportJson.ok !== true ||
+      Number(exportJson.count) !== 2 ||
+      !exportIds.includes("acme") ||
+      !exportIds.includes("other") ||
+      exportCsvRes.status !== 200 ||
+      !String(exportCsvRes.headers.get("content-type") || "").includes("text/csv") ||
+      exportLines[0] !== "tenant,spend_usd,budget_usd,remaining_usd,denied_count" ||
+      exportLines.length !== 3 ||
+      !exportLines.some((l) => l.startsWith("acme,1.000000,10.000000,9.000000,")) ||
+      !exportLines.some((l) => l.startsWith("other,2.000000,5.000000,3.000000,")) ||
+      exportCsvAlias !== exportCsv
+    ) {
+      console.error("smoke export GET /v1/tenants.csv failed", {
+        status: exportCsvRes.status,
+        exportCsv,
+        exportJson,
+      });
+      process.exit(1);
+    }
+    console.log("export-ok", { header: exportLines[0], rows: exportLines.length - 1, tenants: exportIds });
+  } finally {
+    await closeServer(exportServed.server);
+  }
+
+  const periodFlagOk =
+    ENV_BUDGET_PERIOD === "BUDGET_PERIOD" &&
+    ENV_BUDGET_PERIOD_ALIAS === "OTEL_AI_COST_BUDGET_PERIOD" &&
+    BUDGET_PERIOD_DAY === "day" &&
+    resolveBudgetPeriod(null, {}) === null &&
+    resolveBudgetPeriod(null, { [ENV_BUDGET_PERIOD]: "day" }) === "day" &&
+    resolveBudgetPeriod(null, { [ENV_BUDGET_PERIOD_ALIAS]: "day" }) === "day" &&
+    resolveBudgetPeriod("day", { [ENV_BUDGET_PERIOD]: "off" }) === "day" &&
+    resolveBudgetPeriod("off", { [ENV_BUDGET_PERIOD]: "day" }) === null &&
+    resolveBudgetPeriod("", { [ENV_BUDGET_PERIOD]: "day" }) === null;
+  if (!periodFlagOk) {
+    console.error("smoke resolveBudgetPeriod failed");
+    process.exit(1);
+  }
+  const periodTodayIso = new Date().toISOString();
+  const periodOldIso = "2024-01-15T12:00:00.000Z";
+  const periodOld = {
+    timestamp: periodOldIso,
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      tenant: "acme",
+      "gen_ai.cost.usd": 9,
+    },
+  };
+  const periodToday = {
+    timestamp: periodTodayIso,
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      tenant: "acme",
+      "gen_ai.cost.usd": 1,
+    },
+  };
+  const periodIncoming = {
+    timestamp: periodTodayIso,
+    attributes: {
+      "gen_ai.request.model": "gpt-4o-mini",
+      tenant: "acme",
+      "gen_ai.cost.usd": 1.5,
+    },
+  };
+  const periodCsv = formatTenantsCsv([periodOld, periodToday], {
+    budgets: { acme: 10 },
+    period: "day",
+  });
+  const periodCsvLines = periodCsv.trim().split("\n");
+  if (
+    periodCsvLines[0] !== "tenant,spend_usd,budget_usd,remaining_usd,denied_count" ||
+    !periodCsvLines.some((l) => l.startsWith("acme,1.000000,10.000000,9.000000,"))
+  ) {
+    console.error("smoke period CSV remaining must count only today", periodCsv);
+    process.exit(1);
+  }
+  const periodOffCsv = formatTenantsCsv([periodOld, periodToday], { budgets: { acme: 10 } });
+  if (!periodOffCsv.includes("acme,10.000000,10.000000,0.000000,")) {
+    console.error("smoke default cumulative CSV must still sum old+today", periodOffCsv);
+    process.exit(1);
+  }
+  const periodOldReport = report([periodOld], DEFAULT_PRICES, { tenantBudgets: { acme: 2 } });
+  const periodAllow = applyBudgetDeny([periodToday], periodOldReport, { acme: 2 }, {
+    period: "day",
+    store: [periodOld],
+  });
+  if (periodAllow.denied !== 0 || periodAllow.kept.length !== 1) {
+    console.error("smoke period would-exceed must ignore previous-day spend", periodAllow, periodOldReport);
+    process.exit(1);
+  }
+  const periodBothReport = report([periodOld, periodToday], DEFAULT_PRICES, { tenantBudgets: { acme: 2 } });
+  const periodWould = applyBudgetDeny([periodIncoming], periodBothReport, { acme: 2 }, {
+    period: "day",
+    store: [periodOld, periodToday],
+  });
+  if (periodWould.denied !== 1 || periodWould.kept.length !== 0) {
+    console.error("smoke period would-exceed must use today spend only", periodWould, periodBothReport);
+    process.exit(1);
+  }
+  const periodServed = createReportServer({
+    spans: [],
+    groupBy: "day",
+    version: VERSION,
+    tenantBudgets: { acme: 2 },
+    budgetPeriod: "day",
+    denyOnWouldExceed: true,
+  });
+  const periodAddr = await listen(periodServed.server, 0, "127.0.0.1");
+  const periodBase = `http://127.0.0.1:${periodAddr.port}`;
+  try {
+    const oldPost = await fetch(`${periodBase}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [periodOld] }),
+    });
+    const oldBody = await oldPost.json();
+    const todayPost = await fetch(`${periodBase}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [periodToday] }),
+    });
+    const todayBody = await todayPost.json();
+    const csvAfter = await (await fetch(`${periodBase}/v1/tenants.csv`)).text();
+    const jsonAfter = await (await fetch(`${periodBase}/v1/tenants`)).json();
+    const acmeRow = (jsonAfter.tenants || []).find((t) => t.id === "acme");
+    const denyPost = await fetch(`${periodBase}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [periodIncoming] }),
+    });
+    const denyBody = await denyPost.json();
+    const csvDenied = await (await fetch(`${periodBase}/v1/tenants.csv`)).text();
+    const csvDeniedLines = csvDenied.trim().split("\n");
+    if (
+      oldPost.status !== 200 ||
+      oldBody.denied !== 0 ||
+      todayPost.status !== 200 ||
+      todayBody.denied !== 0 ||
+      Number(acmeRow?.usd) !== 1 ||
+      !csvAfter.includes("acme,1.000000,2.000000,1.000000,0") ||
+      denyPost.status !== 200 ||
+      denyBody.denied !== 1 ||
+      !csvDeniedLines.some((l) => l.startsWith("acme,1.000000,2.000000,1.000000,1"))
+    ) {
+      console.error("smoke period HTTP window failed", {
+        oldBody,
+        todayBody,
+        csvAfter,
+        jsonAfter,
+        denyBody,
+        csvDenied,
+        today: utcToday(),
+      });
+      process.exit(1);
+    }
+    console.log("period-ok");
+  } finally {
+    await closeServer(periodServed.server);
+  }
+
+  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period`);
 } else if (cmd === "models" || cmd === "prices") {
   console.log(JSON.stringify(modelsJson(), null, 2));
 } else if (cmd === "demo") {
@@ -2991,6 +3671,12 @@ if (cmd === "--version" || cmd === "-V") {
   );
   const hookUrl = webhookUrlFromArgs(args);
   const hookSecret = webhookSecretFromArgs(args);
+  const denyOnWouldExceed = resolveDenyOnWouldExceed(
+    Object.prototype.hasOwnProperty.call(args, "denyOnWouldExceed") ? args.denyOnWouldExceed : null
+  );
+  const budgetPeriod = resolveBudgetPeriod(
+    Object.prototype.hasOwnProperty.call(args, "budgetPeriod") ? args.budgetPeriod : null
+  );
   const served = createReportServer({
     spans,
     groupBy,
@@ -3004,6 +3690,8 @@ if (cmd === "--version" || cmd === "-V") {
     spanMax,
     webhookUrl: hookUrl,
     webhookSecret: hookSecret,
+    denyOnWouldExceed,
+    budgetPeriod: budgetPeriod == null ? "off" : budgetPeriod,
   });
   const { server, reload, beginShutdown } = served;
   let watchTimer = null;
@@ -3039,7 +3727,7 @@ if (cmd === "--version" || cmd === "-V") {
     console.log(`otel-ai-cost listening on http://${host}:${bound}`);
     console.log(`in=${absIn}`);
     console.log(`groupBy=${groupBy}`);
-    console.log("GET /health  GET /ready  GET /  GET /report.json  GET /v1/costs.csv  GET /v1/costs.md  GET /v1/costs.gha.txt  GET /v1/budgets  GET /v1/models  GET /v1/config  GET /v1/spans  GET /v1/tenants  GET /openapi.json  GET /metrics  POST /v1/traces");
+    console.log("GET /health  GET /ready  GET /  GET /report.json  GET /v1/costs.csv  GET /v1/costs.md  GET /v1/costs.gha.txt  GET /v1/budgets  GET /v1/models  GET /v1/config  GET /v1/spans  GET /v1/tenants  GET /v1/tenants.csv  GET /openapi.json  GET /metrics  POST /v1/traces");
     console.log(`cors=${corsOrigins.length ? corsOrigins.join(",") : "deny"}`);
     console.log(`rate_limit_per_minute=${rateLimit == null ? "unlimited" : rateLimit}`);
     console.log(
@@ -3054,6 +3742,7 @@ if (cmd === "--version" || cmd === "-V") {
     console.log(`watch=${args.watch ? `poll ${WATCH_POLL_MS}ms` : "off"}`);
     console.log(`ingestToken=${ingestToken ? "on" : "off"}`);
     console.log(`spanMax=${spanMax === 0 ? "unlimited" : spanMax}`);
+    console.log(`budgetPeriod=${budgetPeriod || "off"}`);
     console.log(`logJson=${logJsonEnabled ? "on" : "off"}`);
     console.log("hosted dashboard = paid later (this local serve is OSS)");
     if (args.watch) {

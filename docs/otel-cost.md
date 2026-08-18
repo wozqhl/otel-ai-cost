@@ -2,7 +2,7 @@
 
 > E · otel-ai-cost · local-mvp. Companion: [collector-contrib-issue.md](./collector-contrib-issue.md) (draft only; not filed).
 
-This service is an **OTel-native tenant spend + budget deny** plane. It estimates USD from GenAI span attributes, rolls up by tenant, and rejects further OTLP ingest for a tenant that is already over its configured budget.
+This service is an **OTel-native tenant spend + budget deny** plane. It estimates USD from GenAI span attributes, rolls up by tenant, and rejects further OTLP ingest when a tenant is already over budget or the incoming cost would exceed it.
 
 ## Positioning (honest, no fake stats)
 
@@ -31,6 +31,7 @@ Attributes may be a map or an OTLP key/value list (`stringValue` / `intValue` / 
 | `gen_ai.usage.input_tokens` (or `span.inputTokens`) | Input tokens. |
 | `gen_ai.usage.output_tokens` (or `span.outputTokens`) | Output tokens. |
 | `tenant` (span attr or `span.tenant`) | Tenant id. Missing / null / whitespace becomes `"_"` (documented sentinel). |
+| `gen_ai.cost.usd` (if present) | Incoming USD for this span when a finite number ≥ 0. Missing / invalid → token × price. Not a shipped OTel semantic convention. |
 | `timestamp` / `startTime` / `startTimeUnixNano` / `endTimeUnixNano` | UTC day + ISO `ts` on `/v1/spans`. |
 
 **Never stored on `/v1/spans` or `/v1/tenants`:** `gen_ai.prompt`, `gen_ai.completion`, emails, API keys, `Authorization`. Filter/redact packs still strip those on the CLI path.
@@ -52,7 +53,7 @@ HTTP JSON (`GET /report.json`, `GET /v1/costs`, `GET /v1/tenants`) already expos
 | `otel_ai_cost_output_tokens` | gauge | sum of `outTok` |
 | `otel_ai_cost_span_count` | counter | snapshot row count |
 
-**Budget deny:** after a tenant spend is already greater than its budget, further `POST /v1/traces` spans for that tenant are **not stored**. The POST stays **200** `{ ok, accepted, denied }` (`accepted` is still the parsed count, same as span-max). `_` is not gated unless you set a budget for `_`. No tenant budgets means deny never fires. When `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL → still **200** `{denied:N}`.
+**Budget deny:** ingest is denied when the tenant is already over budget **or** `current + incoming` would exceed it (default; exact-on-budget allowed). Denied `POST /v1/traces` spans are **not stored**. The POST stays **200** `{ ok, accepted, denied }` (`accepted` is still the parsed count, same as span-max). `DENY_ON_WOULD_EXCEED=false` restores deny-only-after-already-over. `_` is not gated unless you set a budget for `_`. No tenant budgets means deny never fires. When `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL → still **200** `{denied:N}`.
 
 Grafana: dedicated `deploy/grafana/e-otel-ai-cost.json` (per-tenant spend, remaining, deny, tokens, top models). Shared portfolio panels (Total USD, Cost by model) stay in `oss-cash-lab.json` — do not edit that file from this stream.
 

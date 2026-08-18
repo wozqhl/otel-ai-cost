@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, DEFAULT_PRICES, applyBudgetDeny, spanTenant, ingestDenyWebhookCheck } from "./cost.js";
+import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, formatTenantsCsv, DEFAULT_PRICES, applyBudgetDeny, spanTenant, ingestDenyWebhookCheck, resolveDenyOnWouldExceed, resolveBudgetPeriod, stampIngestTime, spansInBudgetPeriod, utcToday } from "./cost.js";
 import { corsResponseHeaders, handlePreflight, normalizeCors } from "./cors.js";
 import { resolveRequestId, REQUEST_ID_HEADER } from "./request-id.js";
 import { attachAccessLog } from "./access-log.js";
@@ -150,14 +150,18 @@ export function loadSpansFile(file) {
   throw new Error("spans JSON must be an array or {spans:[]} or OTLP resourceSpans");
 }
 
-function snapshotFromSpans(spans, { groupBy, prices, version, tenantBudgets, budget, denyTotal, denyByTenant }) {
+function snapshotFromSpans(spans, { groupBy, prices, version, tenantBudgets, budget, denyTotal, denyByTenant, period, now }) {
   const r = report(spans || [], prices, { tenantBudgets });
   const html = formatHtml(r, { groupBy: groupBy === "day" ? "day" : groupBy || null });
   const json = reportJson(r, { groupBy });
   const csv = formatCsv(r);
   const md = formatMd(r);
   const gha = formatGha(r, { budget });
-  const metricsText = renderCostMetrics(r, { tenantBudgets, denyTotal, denyByTenant });
+  const metricsReport =
+    period === "day"
+      ? { ...r, byTenant: report(spansInBudgetPeriod(spans, period, now), prices, { tenantBudgets }).byTenant }
+      : r;
+  const metricsText = renderCostMetrics(metricsReport, { tenantBudgets, denyTotal, denyByTenant });
   const health = {
     ok: true,
     service: "otel-ai-cost",
@@ -203,9 +207,9 @@ export function startSpansWatch(filePath, { reload, load = loadSpansFile, pollMs
 /**
  * Build a stdlib http.Server that serves a snapshot cost report.
  * GET /health, GET /ready, GET / (HTML + SVG, daily when groupBy=day), GET /report.json,
- * GET /v1/costs.csv, GET /v1/costs.md, GET /v1/costs.gha.txt, GET /v1/costs?format=csv|json|md|gha, GET /v1/budgets, GET /v1/models, GET /v1/config, GET /v1/spans, GET /v1/tenants, GET /openapi.json, GET /metrics
+ * GET /v1/costs.csv, GET /v1/costs.md, GET /v1/costs.gha.txt, GET /v1/costs?format=csv|json|md|gha, GET /v1/budgets, GET /v1/models, GET /v1/config, GET /v1/spans, GET /v1/tenants, GET /v1/tenants.csv, GET /openapi.json, GET /metrics
  * POST /v1/traces (alias POST /v1/otlp/v1/traces) OTLP JSON ingest into the in-memory store.
- * Over-budget ingest deny fires the existing webhook once per denied request (HMAC/timestamp if set).
+ * Over-budget / would-exceed ingest deny fires the existing webhook once per denied request (HMAC/timestamp if set).
  * Optional CORS: corsOrigins CSV list (`*` allowed); empty/omit = deny extra CORS.
  * `reload(spans)` replaces the in-memory store (watch) then caps; ingested spans are not kept.
  * Over `--span-max` / SPAN_MAX (default 50000; 0 = unlimited), drop oldest. Costs recompute from the window.
@@ -229,6 +233,8 @@ export function createReportServer({
   spanMax,
   webhookUrl = null,
   webhookSecret = null,
+  denyOnWouldExceed,
+  budgetPeriod,
 } = {}) {
   const snapOpts = { groupBy, prices, version, tenantBudgets, budget };
   const budgets = budgetsJson({ budget, tenantBudgets });
@@ -236,15 +242,44 @@ export function createReportServer({
   const resolvedSpanMax = resolveSpanMax(spanMax);
   const resolvedWebhookUrl = webhookUrl == null || webhookUrl === "" ? null : String(webhookUrl);
   const resolvedWebhookSecret = webhookSecret == null || webhookSecret === "" ? null : String(webhookSecret);
+  const resolvedDenyOnWouldExceed = resolveDenyOnWouldExceed(
+    denyOnWouldExceed === undefined ? null : denyOnWouldExceed
+  );
+  const resolvedBudgetPeriod =
+    budgetPeriod === undefined
+      ? resolveBudgetPeriod(null)
+      : resolveBudgetPeriod(budgetPeriod == null || budgetPeriod === "" ? "off" : budgetPeriod);
   let store = Array.isArray(spans) ? spans.slice() : [];
+  const bootNow = Date.now();
+  for (const s of store) stampIngestTime(s, bootNow);
   capSpans(store, resolvedSpanMax);
-  let denyTotal = 0;
-  const denyByTenant = new Map();
+  const denyEvents = [];
+  function denyByTenantAt(now = Date.now()) {
+    const m = new Map();
+    const today = utcToday(now);
+    for (const e of denyEvents) {
+      if (resolvedBudgetPeriod === "day" && utcToday(e.ts) !== today) continue;
+      const tenant = e.tenant || "_";
+      m.set(tenant, (m.get(tenant) || 0) + 1);
+    }
+    return m;
+  }
+  function denyTotalAt(now = Date.now()) {
+    let n = 0;
+    for (const c of denyByTenantAt(now).values()) n += c;
+    return n;
+  }
   function allSpans() {
     return store;
   }
-  function snapOptsWithDeny() {
-    return { ...snapOpts, denyTotal, denyByTenant };
+  function snapOptsWithDeny(now = Date.now()) {
+    return {
+      ...snapOpts,
+      denyTotal: denyTotalAt(now),
+      denyByTenant: denyByTenantAt(now),
+      period: resolvedBudgetPeriod,
+      now,
+    };
   }
   let snap = snapshotFromSpans(allSpans(), snapOptsWithDeny());
   const cors = normalizeCors(corsOrigins);
@@ -279,23 +314,38 @@ export function createReportServer({
   }
 
   function reload(nextSpans) {
+    const now = Date.now();
     store = Array.isArray(nextSpans) ? nextSpans.slice() : [];
+    for (const s of store) stampIngestTime(s, now);
     capSpans(store, resolvedSpanMax);
     return rebuild();
   }
 
+  function budgetReportAt(now = Date.now()) {
+    if (resolvedBudgetPeriod === "day") {
+      return report(spansInBudgetPeriod(store, resolvedBudgetPeriod, now), prices, { tenantBudgets });
+    }
+    return snap.report;
+  }
+
   function ingest(incoming) {
+    const now = Date.now();
     const list = Array.isArray(incoming) ? incoming : [];
-    const reportAtDeny = snap.report;
-    const gated = applyBudgetDeny(list, reportAtDeny, tenantBudgets);
+    for (const s of list) stampIngestTime(s, now);
+    const reportAtDeny = budgetReportAt(now);
+    const gated = applyBudgetDeny(list, reportAtDeny, tenantBudgets, {
+      denyOnWouldExceed: resolvedDenyOnWouldExceed,
+      prices,
+      period: resolvedBudgetPeriod,
+      now,
+      store,
+    });
     const denyCheck = gated.denied
       ? ingestDenyWebhookCheck(gated, reportAtDeny, tenantBudgets)
       : null;
     if (gated.denied) {
-      denyTotal += gated.denied;
       for (const span of gated.deniedSpans) {
-        const tenant = spanTenant(span);
-        denyByTenant.set(tenant, (denyByTenant.get(tenant) || 0) + 1);
+        denyEvents.push({ tenant: spanTenant(span), ts: now });
       }
     }
     if (gated.kept.length) store.push(...gated.kept);
@@ -455,12 +505,43 @@ export function createReportServer({
       sendJson(res, 200, spansJson(allSpans(), { prices }), extra);
       return;
     }
+    if (pathName === "/v1/tenants.csv") {
+      // Chargeback-lite CSV from in-memory totals — same tenants as GET /v1/tenants JSON.
+      const rawTenantCsv = url.searchParams.get("tenant");
+      const tenantCsv =
+        rawTenantCsv == null || String(rawTenantCsv).trim() === "" ? null : String(rawTenantCsv).trim();
+      sendCsv(
+        res,
+        200,
+        formatTenantsCsv(allSpans(), {
+          prices,
+          budgets: tenantBudgets,
+          tenant: tenantCsv,
+          denyByTenant: denyByTenantAt(),
+          period: resolvedBudgetPeriod,
+        }),
+        extra
+      );
+      return;
+    }
     if (pathName === "/v1/tenants") {
       // Per-tenant spend rollup — never prompts, completions, API keys, Authorization, or the price catalog.
       const rawTenant = url.searchParams.get("tenant");
       const tenant =
         rawTenant == null || String(rawTenant).trim() === "" ? null : String(rawTenant).trim();
-      sendJson(res, 200, tenantsJson(allSpans(), { prices, budgets: tenantBudgets, tenant }), extra);
+      const fmt = (url.searchParams.get("format") || "json").trim().toLowerCase();
+      const tenantOpts = {
+        prices,
+        budgets: tenantBudgets,
+        tenant,
+        denyByTenant: denyByTenantAt(),
+        period: resolvedBudgetPeriod,
+      };
+      if (fmt === "csv") {
+        sendCsv(res, 200, formatTenantsCsv(allSpans(), tenantOpts), extra);
+        return;
+      }
+      sendJson(res, 200, tenantsJson(allSpans(), tenantOpts), extra);
       return;
     }
     if (pathName === "/metrics") {
@@ -565,6 +646,7 @@ export function createReportServer({
     ingestToken: resolvedToken,
     maxBodyBytes: bodyLimit,
     spanMax: resolvedSpanMax,
+    budgetPeriod: resolvedBudgetPeriod,
     get spans() {
       return store;
     },

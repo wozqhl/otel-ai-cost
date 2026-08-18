@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "OTel AI Cost Local Serve API",
-    "description": "Local OSS cost report HTTP snapshot (Node stdlib `http`; hosted dashboard = paid later). Documents `GET /health`, `GET /ready`, `GET /` (HTML+SVG), `GET /report.json`, `GET /v1/costs.csv`, `GET /v1/costs.md`, `GET /v1/costs.gha.txt`, `GET /v1/costs?format=csv|json|md|gha`, `GET /openapi.json`, `GET /metrics` (Prometheus text: `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_span_count`). `GET /ready` is **200** `{ok:true, service}` plus the same snapshot fields as `/health` when healthy (stateless; no circuit/queue). On SIGTERM/SIGINT, **503** `{ok:false, reason:\"shutting_down\"}` (liveness `GET /health` stays 200 with `shuttingDown: true` while draining). Compose/stack-demo healthchecks stay on `/health`. `GET /openapi.json` serves this file. Report is computed once at process start. Optional `X-Request-Id` request header: echoed on **every** response (including 4xx / OPTIONS). If omitted or empty, the server generates a UUID (max 128 chars; CR/LF stripped). Default allow/expose CORS headers include `X-Request-Id`. **403 CORS**: optional `--cors-origins` CSV or env `OTEL_AI_COST_CORS_ORIGINS` (`*` allowed). Default omitted/empty = no extra CORS headers (deny; OPTIONS **404**). When enabled with an explicit list, OPTIONS preflight for a listed Origin \u2192 **204** with `Access-Control-Allow-Origin` / `Allow-Methods` / `Allow-Headers`; unlisted Origin (e.g. `http://evil.example`) \u2192 **403** `{error:\"forbidden\",reason:\"cors_denied\"}` (no ACAO). Matching GET includes ACAO. GET from a disallowed Origin still executes (e.g. 200) but omits ACAO. local-mvp isolated prove uses `http://localhost:3000`; main serve / stack-demo default deny. **429 rate limit**: `--rate-limit` / env `RATE_LIMIT_PER_MINUTE` (alias `RATE_LIMIT_RPM`) default **120** requests/minute per client IP (`X-Forwarded-For` first hop, else socket). In-memory sliding window. Exceed \u2192 `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. `/health`, `/ready`, `/metrics` are **not** rate-limited (k8s probes / Prometheus). Default `Access-Control-Expose-Headers` includes `Retry-After` and `X-Request-Id` (browser JS can read 429 `Retry-After`). 0 disables the limit. Optional per-tenant budget: `--tenant-budget acme=10,other=5` or env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS=acme:10`). After `byTenant` rollup, tenants with `usd` > budget appear on JSON as `budgetBreaches: [{tenant,usd,budget}]` (HTTP 200, never 500). Missing tenant budgets \u2192 `[]` and no extra webhook. Catch-all tenant `_` is not gated unless `_` is set explicitly. Global `--budget` (totalUsd) is independent. Tenant-breach webhook reuses the budget webhook (`tenant` in JSON body; HMAC still signs raw body; no tokens). **Budget thresholds (not spend):** `GET /v1/budgets` returns `{ok:true, globalUsd: number|null, tenants:{acme:10,\u2026}}` from `--budget` `maxTotalUsd` + `--tenant-budget` / env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS`). Missing config \u2192 `globalUsd: null` and `tenants: {}`. **Not spend** (`budgetBreaches` stays on `/v1/costs`). No secrets. CORS + `X-Request-Id` same as other GET. **Pricing catalog (rates, not spend):** `GET /v1/models` returns `{ok:true, models:[{id, inputPerMTok, outputPerMTok, \u2026}], defaultModel:null, pack:null}` from the loaded price table (built-in `DEFAULT_PRICES` unless a custom table is loaded). Field names match the table (`inputPerMTok` / `outputPerMTok` on the built-in pack). A single `usdPer1k` is used when that is all an entry has. Cached rates only when present. Empty/default still **200** with the built-in table (not necessarily empty). No secrets. CORS + `X-Request-Id` same as other GET. **OTLP JSON ingest (live FinOps):** `POST /v1/traces` (alias `POST /v1/otlp/v1/traces`) accepts simplified OTLP `ExportTraceServiceRequest` JSON (`resourceSpans[].scopeSpans[].spans[]`) or E's existing flat `{spans:[]}` / array. Merges into the in-memory store so the next `GET /v1/costs` / HTML / CSV / Markdown / GHA annotations / metrics include them. In-memory cap default **50000** (`--span-max` / `SPAN_MAX`; `0` = unlimited). Over cap, drop oldest; costs recompute from the retained window. `accepted` is parsed count, not how many fit. `--watch` file reload replaces the store then caps. Auth: none by default (local). Optional `INGEST_TOKEN` / `--ingest-token`: when set, require `Authorization: Bearer`; missing/wrong \u2192 **401** `{error:\"unauthorized\"}` (no token in body). Default off so stack-demo never 401s. Bad JSON \u2192 **400** `{error:\"bad_json\"}`. Empty spans \u2192 **200** `{ok:true, accepted:0}`. Body over **1048576** bytes \u2192 **413** `{error:\"payload_too_large\"}` before JSON parse (Content-Length early or stream count, B-style). Ingest **is** rate-limited like other app routes. JSON only (no protobuf). When a tenant is already over `--tenant-budget`, further spans for that tenant are not stored; the POST stays **200** `{ok:true, accepted, denied}`. If `--webhook-url` / `OTEL_AI_COST_WEBHOOK_URL` is set, the existing budget-breach webhook fires **once per denied request** (HMAC/timestamp if configured). Payload includes `tenant`, `spend`, `budget`, `denied` \u2014 never prompt text. No webhook URL \u2192 still **200** `{denied:N}`. **GitHub Actions annotations:** `GET /v1/costs.gha.txt` and `GET /v1/costs?format=gha` (alias `annotations`) return workflow commands (`text/plain`; global `::error title=budget::totalUsd X > budget Y`; each tenant `::error title=tenant/<id>::usd X > budget Y`; no breach \u2192 empty 200, no `::error`). Does not require GitHub. **Redacted runtime config (knobs, not spend):** `GET /v1/config` returns `{ok:true, spanCap, spansMax, rateLimit:{perMinute}, cors:{origins}, pack, hasGlobalBudget, tenantBudgetCount, webhooks:{hasUrl,hasSecret}}`. Allowlist only \u2014 **never** webhook URL (query tokens), webhook secret, ingest token / API keys, or the price table (that is `GET /v1/models`). Dollar thresholds stay on `GET /v1/budgets` (`hasGlobalBudget` / `tenantBudgetCount` are booleans/counts). Public GET like `/v1/budgets`. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes. **Span summaries (FinOps debug):** `GET /v1/spans` returns `{ok:true, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]}` from the in-memory ring (file-loaded + ingested). Allowlist only \u2014 **never** prompt/completion/input/output text, API keys, or Authorization. Cap **100** newest (`truncated: true` when more). `count` is the full retained size. Empty \u2192 `{ok:true, count:0, spans:[]}` **200**. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes. **Tenant inventory (actual spend):** `GET /v1/tenants` returns `{ok:true, count, tenants:[{id, spanCount, usd}]}` from the current in-memory span store (same window as `/v1/spans` / costs). One row per distinct tenant id (missing/empty \u2192 `_`). Sort highest `usd` first, then id. Cap **100** (`truncated: true` when more). `count` is the full tenant count. Empty \u2192 `{ok:true, count:0, tenants:[]}` **200**. Optional `budgetUsd` on a row only when that tenant has a configured budget (`GET /v1/budgets`.tenants); omit otherwise (do not attach the global budget). Optional `?tenant=` exact filter (unknown \u2192 empty 200). Allowlist only \u2014 **never** prompts, completions, API keys, Authorization, webhook URL/secret, ingest token, or the full price catalog. Public GET like `/v1/spans` / `/v1/budgets`. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes.",
+    "description": "Local OSS cost report HTTP snapshot (Node stdlib `http`; hosted dashboard = paid later). Documents `GET /health`, `GET /ready`, `GET /` (HTML+SVG), `GET /report.json`, `GET /v1/costs.csv`, `GET /v1/costs.md`, `GET /v1/costs.gha.txt`, `GET /v1/costs?format=csv|json|md|gha`, `GET /openapi.json`, `GET /metrics` (Prometheus text: `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_span_count`). `GET /ready` is **200** `{ok:true, service}` plus the same snapshot fields as `/health` when healthy (stateless; no circuit/queue). On SIGTERM/SIGINT, **503** `{ok:false, reason:\"shutting_down\"}` (liveness `GET /health` stays 200 with `shuttingDown: true` while draining). Compose/stack-demo healthchecks stay on `/health`. `GET /openapi.json` serves this file. Report is computed once at process start. Optional `X-Request-Id` request header: echoed on **every** response (including 4xx / OPTIONS). If omitted or empty, the server generates a UUID (max 128 chars; CR/LF stripped). Default allow/expose CORS headers include `X-Request-Id`. **403 CORS**: optional `--cors-origins` CSV or env `OTEL_AI_COST_CORS_ORIGINS` (`*` allowed). Default omitted/empty = no extra CORS headers (deny; OPTIONS **404**). When enabled with an explicit list, OPTIONS preflight for a listed Origin → **204** with `Access-Control-Allow-Origin` / `Allow-Methods` / `Allow-Headers`; unlisted Origin (e.g. `http://evil.example`) → **403** `{error:\"forbidden\",reason:\"cors_denied\"}` (no ACAO). Matching GET includes ACAO. GET from a disallowed Origin still executes (e.g. 200) but omits ACAO. local-mvp isolated prove uses `http://localhost:3000`; main serve / stack-demo default deny. **429 rate limit**: `--rate-limit` / env `RATE_LIMIT_PER_MINUTE` (alias `RATE_LIMIT_RPM`) default **120** requests/minute per client IP (`X-Forwarded-For` first hop, else socket). In-memory sliding window. Exceed → `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. `/health`, `/ready`, `/metrics` are **not** rate-limited (k8s probes / Prometheus). Default `Access-Control-Expose-Headers` includes `Retry-After` and `X-Request-Id` (browser JS can read 429 `Retry-After`). 0 disables the limit. Optional per-tenant budget: `--tenant-budget acme=10,other=5` or env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS=acme:10`). After `byTenant` rollup, tenants with `usd` > budget appear on JSON as `budgetBreaches: [{tenant,usd,budget}]` (HTTP 200, never 500). Missing tenant budgets → `[]` and no extra webhook. Catch-all tenant `_` is not gated unless `_` is set explicitly. Global `--budget` (totalUsd) is independent. Tenant-breach webhook reuses the budget webhook (`tenant` in JSON body; HMAC still signs raw body; no tokens). **Budget thresholds (not spend):** `GET /v1/budgets` returns `{ok:true, globalUsd: number|null, tenants:{acme:10,…}}` from `--budget` `maxTotalUsd` + `--tenant-budget` / env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS`). Missing config → `globalUsd: null` and `tenants: {}`. **Not spend** (`budgetBreaches` stays on `/v1/costs`). No secrets. CORS + `X-Request-Id` same as other GET. **Pricing catalog (rates, not spend):** `GET /v1/models` returns `{ok:true, models:[{id, inputPerMTok, outputPerMTok, …}], defaultModel:null, pack:null}` from the loaded price table (built-in `DEFAULT_PRICES` unless a custom table is loaded). Field names match the table (`inputPerMTok` / `outputPerMTok` on the built-in pack). A single `usdPer1k` is used when that is all an entry has. Cached rates only when present. Empty/default still **200** with the built-in table (not necessarily empty). No secrets. CORS + `X-Request-Id` same as other GET. **OTLP JSON ingest (live FinOps):** `POST /v1/traces` (alias `POST /v1/otlp/v1/traces`) accepts simplified OTLP `ExportTraceServiceRequest` JSON (`resourceSpans[].scopeSpans[].spans[]`) or E's existing flat `{spans:[]}` / array. Merges into the in-memory store so the next `GET /v1/costs` / HTML / CSV / Markdown / GHA annotations / metrics include them. In-memory cap default **50000** (`--span-max` / `SPAN_MAX`; `0` = unlimited). Over cap, drop oldest; costs recompute from the retained window. `accepted` is parsed count, not how many fit. `--watch` file reload replaces the store then caps. Auth: none by default (local). Optional `INGEST_TOKEN` / `--ingest-token`: when set, require `Authorization: Bearer`; missing/wrong → **401** `{error:\"unauthorized\"}` (no token in body). Default off so stack-demo never 401s. Bad JSON → **400** `{error:\"bad_json\"}`. Empty spans → **200** `{ok:true, accepted:0}`. Body over **1048576** bytes → **413** `{error:\"payload_too_large\"}` before JSON parse (Content-Length early or stream count, B-style). Ingest **is** rate-limited like other app routes. JSON only (no protobuf). When a tenant is already over `--tenant-budget` or the incoming cost would exceed it (default; `DENY_ON_WOULD_EXCEED=false` restores deny-only-after-over), those spans are not stored; the POST stays **200** `{ok:true, accepted, denied}`. If `--webhook-url` / `OTEL_AI_COST_WEBHOOK_URL` is set, the existing budget-breach webhook fires **once per denied request** (HMAC/timestamp if configured). Payload includes `tenant`, `spend`, `budget`, `denied` — never prompt text. No webhook URL → still **200** `{denied:N}`. **GitHub Actions annotations:** `GET /v1/costs.gha.txt` and `GET /v1/costs?format=gha` (alias `annotations`) return workflow commands (`text/plain`; global `::error title=budget::totalUsd X > budget Y`; each tenant `::error title=tenant/<id>::usd X > budget Y`; no breach → empty 200, no `::error`). Does not require GitHub. **Redacted runtime config (knobs, not spend):** `GET /v1/config` returns `{ok:true, spanCap, spansMax, rateLimit:{perMinute}, cors:{origins}, pack, hasGlobalBudget, tenantBudgetCount, webhooks:{hasUrl,hasSecret}}`. Allowlist only — **never** webhook URL (query tokens), webhook secret, ingest token / API keys, or the price table (that is `GET /v1/models`). Dollar thresholds stay on `GET /v1/budgets` (`hasGlobalBudget` / `tenantBudgetCount` are booleans/counts). Public GET like `/v1/budgets`. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes. **Span summaries (FinOps debug):** `GET /v1/spans` returns `{ok:true, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]}` from the in-memory ring (file-loaded + ingested). Allowlist only — **never** prompt/completion/input/output text, API keys, or Authorization. Cap **100** newest (`truncated: true` when more). `count` is the full retained size. Empty → `{ok:true, count:0, spans:[]}` **200**. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes. **Chargeback-lite CSV:** `GET /v1/tenants.csv` (alias `GET /v1/tenants?format=csv`) exports the same in-memory totals as `tenant,spend_usd,budget_usd,remaining_usd,denied_count` (`denied_count` from ingest denies; budget/remaining blank when unset; empty → header only). JSON `GET /v1/tenants` is unchanged. **Tenant inventory (actual spend):** `GET /v1/tenants` returns `{ok:true, count, tenants:[{id, spanCount, usd}]}` from the current in-memory span store (same window as `/v1/spans` / costs). One row per distinct tenant id (missing/empty → `_`). Sort highest `usd` first, then id. Cap **100** (`truncated: true` when more). `count` is the full tenant count. Empty → `{ok:true, count:0, tenants:[]}` **200**. Optional `budgetUsd` on a row only when that tenant has a configured budget (`GET /v1/budgets`.tenants); omit otherwise (do not attach the global budget). Optional `?tenant=` exact filter (unknown → empty 200). Allowlist only — **never** prompts, completions, API keys, Authorization, webhook URL/secret, ingest token, or the full price catalog. Public GET like `/v1/spans` / `/v1/budgets`. CORS + `X-Request-Id` same as other GET. Rate-limited like other app routes.",
     "version": "0.1.0",
     "license": {
       "name": "Apache-2.0",
@@ -22,7 +22,7 @@
     },
     {
       "name": "report",
-      "description": "HTML+SVG cost report, structured JSON (UTC daily when groupBy=day), finance CSV (`date,model,spanCount,usd,tenant` \u2014 tenant last), and FinOps Markdown (`# otel-ai-cost` + by-model / by-tenant tables), and GitHub Actions `::error` annotations (`GET /v1/costs.gha.txt` / `?format=gha`; empty when no breach); configured thresholds `GET /v1/budgets` (`globalUsd` + `tenants`, not spend); pricing catalog `GET /v1/models` (`models` rates, not spend); redacted runtime knobs `GET /v1/config` (`spanCap` / CORS / rate-limit / webhook booleans; not spend); span summaries `GET /v1/spans` (`listSpans`; allowlist id/model/tenant/tokens/usd/ts; no prompts/secrets; cap 100 newest); tenant inventory `GET /v1/tenants` (`listTenants`; `{id, spanCount, usd}` + optional `budgetUsd`; no prompts/secrets; cap 100)"
+      "description": "HTML+SVG cost report, structured JSON (UTC daily when groupBy=day), finance CSV (`date,model,spanCount,usd,tenant` — tenant last), and FinOps Markdown (`# otel-ai-cost` + by-model / by-tenant tables), and GitHub Actions `::error` annotations (`GET /v1/costs.gha.txt` / `?format=gha`; empty when no breach); configured thresholds `GET /v1/budgets` (`globalUsd` + `tenants`, not spend); pricing catalog `GET /v1/models` (`models` rates, not spend); redacted runtime knobs `GET /v1/config` (`spanCap` / CORS / rate-limit / webhook booleans; not spend); span summaries `GET /v1/spans` (`listSpans`; allowlist id/model/tenant/tokens/usd/ts; no prompts/secrets; cap 100 newest); tenant inventory `GET /v1/tenants` (`listTenants`; `{id, spanCount, usd}` + optional `budgetUsd`; no prompts/secrets; cap 100); chargeback-lite CSV `GET /v1/tenants.csv` (`getTenantsCsv`; `tenant,spend_usd,budget_usd,remaining_usd,denied_count`)"
     },
     {
       "name": "meta",
@@ -34,7 +34,7 @@
     },
     {
       "name": "config",
-      "description": "Redacted public runtime config (GET /v1/config). Allowlist only \u2014 never secrets."
+      "description": "Redacted public runtime config (GET /v1/config). Allowlist only — never secrets."
     }
   ],
   "paths": {
@@ -44,7 +44,7 @@
           "health"
         ],
         "summary": "Health check",
-        "description": "Liveness plus snapshot `spanCount` and `totalUsd`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied` (see info). Not rate-limited.",
+        "description": "Liveness plus snapshot `spanCount` and `totalUsd`. CORS OPTIONS unlisted Origin → **403** `cors_denied` (see info). Not rate-limited.",
         "operationId": "getHealth",
         "security": [],
         "responses": {
@@ -83,7 +83,7 @@
           "health"
         ],
         "summary": "Readiness (503 while shutting down)",
-        "description": "Readiness. **200** `{ok:true, service}` plus snapshot `spanCount` and `totalUsd` (same as `/health`) when healthy. On SIGTERM/SIGINT, **503** `{ok:false, reason:\"shutting_down\"}` (liveness `GET /health` stays 200 with `shuttingDown: true`). Stateless cost snapshot \u2014 no circuit/queue. Compose/stack-demo healthchecks stay on `/health`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Not rate-limited.",
+        "description": "Readiness. **200** `{ok:true, service}` plus snapshot `spanCount` and `totalUsd` (same as `/health`) when healthy. On SIGTERM/SIGINT, **503** `{ok:false, reason:\"shutting_down\"}` (liveness `GET /health` stays 200 with `shuttingDown: true`). Stateless cost snapshot — no circuit/queue. Compose/stack-demo healthchecks stay on `/health`. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Not rate-limited.",
         "operationId": "getReady",
         "security": [],
         "parameters": [
@@ -148,7 +148,7 @@
           "report"
         ],
         "summary": "HTML cost report",
-        "description": "Self-contained HTML (inline CSS, pure-SVG byModel chart, UTC daily section when groupBy=day). No external script/CDN. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "Self-contained HTML (inline CSS, pure-SVG byModel chart, UTC daily section when groupBy=day). No external script/CDN. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getIndex",
         "security": [],
         "responses": {
@@ -190,7 +190,7 @@
           "report"
         ],
         "summary": "Structured cost report JSON",
-        "description": "Serve default is UTC daily rollup (`groupBy=day`) including `totalUsd` and `days[]`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. Includes `byTenant` and `budgetBreaches` (empty array when no `--tenant-budget` / env).",
+        "description": "Serve default is UTC daily rollup (`groupBy=day`) including `totalUsd` and `days[]`. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. Includes `byTenant` and `budgetBreaches` (empty array when no `--tenant-budget` / env).",
         "operationId": "getReport",
         "security": [],
         "responses": {
@@ -232,7 +232,7 @@
           "report"
         ],
         "summary": "Finance CSV cost export",
-        "description": "Daily-by-model+tenant totals as CSV with header `date,model,spanCount,usd,tenant` (`tenant` last so `date,model,spanCount,usd` greps still match) plus a TOTAL row. Same cost model as `/report.json` (`day` \u2192 `date`, per-model `spanCount`, `usd`). Missing/empty span attr `tenant` \u2192 `_`. Empty spans \u2192 header-only **200**. CORS + `X-Request-Id` same as other GET. Access-logged (not skipped like `/metrics`). Alias: `GET /v1/costs?format=csv`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "Daily-by-model+tenant totals as CSV with header `date,model,spanCount,usd,tenant` (`tenant` last so `date,model,spanCount,usd` greps still match) plus a TOTAL row. Same cost model as `/report.json` (`day` → `date`, per-model `spanCount`, `usd`). Missing/empty span attr `tenant` → `_`. Empty spans → header-only **200**. CORS + `X-Request-Id` same as other GET. Access-logged (not skipped like `/metrics`). Alias: `GET /v1/costs?format=csv`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getCostsCsv",
         "security": [],
         "parameters": [
@@ -275,7 +275,7 @@
           "report"
         ],
         "summary": "FinOps Markdown cost report",
-        "description": "GitHub-flavored Markdown for Slack / email / GitHub Actions `$GITHUB_STEP_SUMMARY`. Shape: `# otel-ai-cost`, `**totalUsd:**` / `**spans:**`, `## by model` table (`model | usd | spans`), `## by tenant` table (`tenant | usd | spans`). `|` in cells is escaped. Empty spans \u2192 heading + zeros + table headers (no data rows), **200**. Same cost model as `/report.json`. CORS + `X-Request-Id` same as other GET. Access-logged (not skipped like `/metrics`). Alias: `GET /v1/costs?format=md`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "GitHub-flavored Markdown for Slack / email / GitHub Actions `$GITHUB_STEP_SUMMARY`. Shape: `# otel-ai-cost`, `**totalUsd:**` / `**spans:**`, `## by model` table (`model | usd | spans`), `## by tenant` table (`tenant | usd | spans`). `|` in cells is escaped. Empty spans → heading + zeros + table headers (no data rows), **200**. Same cost model as `/report.json`. CORS + `X-Request-Id` same as other GET. Access-logged (not skipped like `/metrics`). Alias: `GET /v1/costs?format=md`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getCostsMd",
         "security": [],
         "parameters": [
@@ -318,7 +318,7 @@
           "report"
         ],
         "summary": "GitHub Actions annotations alias (same as GET /v1/costs?format=gha)",
-        "description": "Same body as `GET /v1/costs?format=gha` (workflow commands: global `::error title=budget::totalUsd X > budget Y` when `--budget` maxTotalUsd is exceeded; each tenant `::error title=tenant/<id>::usd X > budget Y` from `budgetBreaches`; no breach \u2192 empty body 200, no `::error`). Content-Type `text/plain`. Does not require GitHub. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "Same body as `GET /v1/costs?format=gha` (workflow commands: global `::error title=budget::totalUsd X > budget Y` when `--budget` maxTotalUsd is exceeded; each tenant `::error title=tenant/<id>::usd X > budget Y` from `budgetBreaches`; no breach → empty body 200, no `::error`). Content-Type `text/plain`. Does not require GitHub. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getCostsGha",
         "security": [],
         "parameters": [
@@ -361,7 +361,7 @@
           "report"
         ],
         "summary": "Cost snapshot (json | csv | md | gha)",
-        "description": "Versioned cost snapshot. Query `format=json` (default) is the same DailyReport body as `GET /report.json`. `format=csv` is the same `text/csv` body as `GET /v1/costs.csv`. `format=md` is the same `text/markdown` body as `GET /v1/costs.md`. `format=gha` (alias `annotations`) is GitHub Actions workflow commands (`text/plain`; same as `GET /v1/costs.gha.txt`; global `::error title=budget::totalUsd X > budget Y`; tenant `::error title=tenant/<id>::usd X > budget Y`; no breach \u2192 empty 200). Unknown format \u2192 **400** `{error:\"bad_format\"}`. Existing `/report.json` clients are unchanged. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. JSON includes `budgetBreaches` (same as `/report.json`).",
+        "description": "Versioned cost snapshot. Query `format=json` (default) is the same DailyReport body as `GET /report.json`. `format=csv` is the same `text/csv` body as `GET /v1/costs.csv`. `format=md` is the same `text/markdown` body as `GET /v1/costs.md`. `format=gha` (alias `annotations`) is GitHub Actions workflow commands (`text/plain`; same as `GET /v1/costs.gha.txt`; global `::error title=budget::totalUsd X > budget Y`; tenant `::error title=tenant/<id>::usd X > budget Y`; no breach → empty 200). Unknown format → **400** `{error:\"bad_format\"}`. Existing `/report.json` clients are unchanged. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. JSON includes `budgetBreaches` (same as `/report.json`).",
         "operationId": "getCosts",
         "security": [],
         "parameters": [
@@ -451,7 +451,7 @@
           "report"
         ],
         "summary": "Configured budget thresholds (not spend)",
-        "description": "Returns configured global + tenant budget **thresholds**, not spend. `{ok:true, globalUsd: number|null, tenants:{acme:10,\u2026}}`. `globalUsd` is `--budget` policy `maxTotalUsd` (missing/empty \u2192 `null`). `tenants` is `--tenant-budget` / env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS`) map (missing \u2192 `{}`). Never includes spend, `budgetBreaches`, webhook secrets, or ingest tokens. CORS + `X-Request-Id` same as other GET. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "Returns configured global + tenant budget **thresholds**, not spend. `{ok:true, globalUsd: number|null, tenants:{acme:10,…}}`. `globalUsd` is `--budget` policy `maxTotalUsd` (missing/empty → `null`). `tenants` is `--tenant-budget` / env `OTEL_AI_COST_TENANT_BUDGETS` (alias `TENANT_BUDGETS`) map (missing → `{}`). Never includes spend, `budgetBreaches`, webhook secrets, or ingest tokens. CORS + `X-Request-Id` same as other GET. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getBudgets",
         "security": [],
         "parameters": [
@@ -461,7 +461,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Configured thresholds. Missing config \u2192 `globalUsd: null` and `tenants: {}`.",
+            "description": "Configured thresholds. Missing config → `globalUsd: null` and `tenants: {}`.",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -500,7 +500,7 @@
           "report"
         ],
         "summary": "Pricing catalog (rates, not spend)",
-        "description": "Returns the loaded price table as a catalog (rates, not spend). `{ok:true, models:[{id, inputPerMTok, outputPerMTok, \u2026}], defaultModel:null, pack:null}`. Built-in table is `DEFAULT_PRICES` (`gpt-4o`, `gpt-4o-mini`, `claude-sonnet` with `inputPerMTok` / `outputPerMTok`). Field names match the table \u2014 do not invent rates. A single `usdPer1k` is used when that is all an entry has. Cached rates only when present. Empty/default still **200** with the built-in table (not necessarily empty). Never includes spend, webhook secrets, or ingest tokens. CORS + `X-Request-Id` same as other GET. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "Returns the loaded price table as a catalog (rates, not spend). `{ok:true, models:[{id, inputPerMTok, outputPerMTok, …}], defaultModel:null, pack:null}`. Built-in table is `DEFAULT_PRICES` (`gpt-4o`, `gpt-4o-mini`, `claude-sonnet` with `inputPerMTok` / `outputPerMTok`). Field names match the table — do not invent rates. A single `usdPer1k` is used when that is all an entry has. Cached rates only when present. Empty/default still **200** with the built-in table (not necessarily empty). Never includes spend, webhook secrets, or ingest tokens. CORS + `X-Request-Id` same as other GET. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getModels",
         "security": [],
         "parameters": [
@@ -554,7 +554,7 @@
           "report"
         ],
         "summary": "Recent span summaries (FinOps debug)",
-        "description": "Allowlisted summaries of recent ingested / file-loaded spans: `{ok, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]}`. Field names match `spanCost` / OTel attrs (`gen_ai.request.model`, `tenant`, `gen_ai.usage.input_tokens` / `output_tokens`, `spanId`/`id`, `timestamp`/`startTimeUnixNano`). **Never** includes prompt/completion/input/output text, API keys, or Authorization. Newest first. Cap **100**; `count` is the full retained ring size; `truncated: true` when more (omitted otherwise). Empty store \u2192 **200** `{ok:true, count:0, spans:[]}`. CORS + `X-Request-Id` same as other GET. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`.",
+        "description": "Allowlisted summaries of recent ingested / file-loaded spans: `{ok, count, spans:[{id, model, tenant, inputTokens, outputTokens, usd, ts}]}`. Field names match `spanCost` / OTel attrs (`gen_ai.request.model`, `tenant`, `gen_ai.usage.input_tokens` / `output_tokens`, `spanId`/`id`, `timestamp`/`startTimeUnixNano`). **Never** includes prompt/completion/input/output text, API keys, or Authorization. Newest first. Cap **100**; `count` is the full retained ring size; `truncated: true` when more (omitted otherwise). Empty store → **200** `{ok:true, count:0, spans:[]}`. CORS + `X-Request-Id` same as other GET. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. CORS OPTIONS unlisted Origin → **403** `cors_denied`.",
         "operationId": "listSpans",
         "security": [],
         "parameters": [
@@ -611,7 +611,7 @@
           "report"
         ],
         "summary": "Per-tenant cost rollup (actual spend)",
-        "description": "Redacted per-tenant spend inventory from the current in-memory span store (same window as `/v1/spans` / costs): `{ok, count, tenants:[{id, spanCount, usd}]}`. One row per distinct tenant id. Missing/empty span attr `tenant` \u2192 `_`. `usd` uses the same rounding as report totals. Sort highest `usd` first, then id. Cap **100**; `count` is the full tenant count; `truncated: true` when more (omitted otherwise). Empty store \u2192 **200** `{ok:true, count:0, tenants:[]}`. Optional `budgetUsd` only when that tenant has a configured budget (`GET /v1/budgets`.tenants); omit the field otherwise. Do not attach the global budget. Optional `?tenant=` exact filter (unknown id \u2192 empty 200). **Never** includes prompt/completion/input/output text, API keys, Authorization, webhook URL/secret, ingest token, or the price catalog. Public GET like `/v1/spans` / `/v1/budgets` (no admin token). CORS + `X-Request-Id` same as other GET. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`.",
+        "description": "Redacted per-tenant spend inventory from the current in-memory span store (same window as `/v1/spans` / costs): `{ok, count, tenants:[{id, spanCount, usd}]}`. One row per distinct tenant id. Missing/empty span attr `tenant` → `_`. `usd` uses the same rounding as report totals. Sort highest `usd` first, then id. Cap **100**; `count` is the full tenant count; `truncated: true` when more (omitted otherwise). Empty store → **200** `{ok:true, count:0, tenants:[]}`. Optional `budgetUsd` only when that tenant has a configured budget (`GET /v1/budgets`.tenants); omit the field otherwise. Do not attach the global budget. Optional `?tenant=` exact filter (unknown id → empty 200). **Never** includes prompt/completion/input/output text, API keys, Authorization, webhook URL/secret, ingest token, or the price catalog. Public GET like `/v1/spans` / `/v1/budgets` (no admin token). CORS + `X-Request-Id` same as other GET. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. CORS OPTIONS unlisted Origin → **403** `cors_denied`.",
         "operationId": "listTenants",
         "security": [],
         "parameters": [
@@ -661,13 +661,59 @@
         }
       }
     },
+    "/v1/tenants.csv": {
+      "get": {
+        "tags": [
+          "report"
+        ],
+        "summary": "Chargeback-lite tenant spend CSV",
+        "description": "In-memory tenant totals as CSV with header `tenant,spend_usd,budget_usd,remaining_usd,denied_count`. Same rollup as `GET /v1/tenants` JSON (highest spend first). `budget_usd` / `remaining_usd` blank when that tenant has no configured budget (`remaining` = budget − spend, may be negative). `denied_count` is the ingest deny counter already tracked per tenant (0 if none). Missing/empty tenant → `_`. Empty store → header-only **200**. Optional `?tenant=` exact filter. Alias: `GET /v1/tenants?format=csv`. **Never** prompts, secrets, or new Prometheus series. CORS + `X-Request-Id` same as other GET. Access-logged (not skipped like `/metrics`). Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`. CORS OPTIONS unlisted Origin → **403** `cors_denied`.",
+        "operationId": "getTenantsCsv",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "CSV tenant spend snapshot (header + one row per tenant; header only when empty)",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Access-Control-Allow-Origin": {
+                "$ref": "#/components/headers/AccessControlAllowOrigin"
+              }
+            },
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "tenant,spend_usd,budget_usd,remaining_usd,denied_count\nacme,1.000000,10.000000,9.000000,0\nother,2.000000,5.000000,3.000000,0\n"
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/CorsDenied"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
     "/v1/traces": {
       "post": {
         "tags": [
           "ingest"
         ],
         "summary": "Ingest OTLP JSON traces",
-        "description": "Live FinOps ingest. `Content-Type: application/json`. Accepts simplified OTLP `ExportTraceServiceRequest` (`resourceSpans[].scopeSpans[].spans[]` with attributes `gen_ai.request.model` / `tenant` already understood by cost.js) or a flat `spans` array. Merges into the in-memory snapshot used by `/`, `/report.json`, `/v1/costs`, `/v1/costs.csv`, `/v1/costs.md, `/v1/costs.gha.txt``, `/metrics`, `/health`, `/ready`. `--watch` still reloads the `--in` file. Auth none by default; when `INGEST_TOKEN` / `--ingest-token` is set, require `Authorization: Bearer`. Missing/wrong \u2192 **401**. Bad JSON \u2192 **400**. Empty spans \u2192 **200** `{ok:true, accepted:0}`. Over 1 MiB \u2192 **413** `payload_too_large`. Rate-limited like other app routes (`/health` `/ready` `/metrics` still skipped). Alias: `POST /v1/otlp/v1/traces`. JSON only \u2014 no protobuf. When a tenant is already over `--tenant-budget`, further spans for that tenant are not stored; response includes `denied` (HTTP **200**; `accepted` stays parsed count). If `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL \u2192 still **200** `{denied:N}`.",
+        "description": "Live FinOps ingest. `Content-Type: application/json`. Accepts simplified OTLP `ExportTraceServiceRequest` (`resourceSpans[].scopeSpans[].spans[]` with attributes `gen_ai.request.model` / `tenant` already understood by cost.js) or a flat `spans` array. Merges into the in-memory snapshot used by `/`, `/report.json`, `/v1/costs`, `/v1/costs.csv`, `/v1/costs.md, `/v1/costs.gha.txt``, `/metrics`, `/health`, `/ready`. `--watch` still reloads the `--in` file. Auth none by default; when `INGEST_TOKEN` / `--ingest-token` is set, require `Authorization: Bearer`. Missing/wrong → **401**. Bad JSON → **400**. Empty spans → **200** `{ok:true, accepted:0}`. Over 1 MiB → **413** `payload_too_large`. Rate-limited like other app routes (`/health` `/ready` `/metrics` still skipped). Alias: `POST /v1/otlp/v1/traces`. JSON only — no protobuf. When a tenant is already over `--tenant-budget` or the incoming cost would exceed it, those spans are not stored; response includes `denied` (HTTP **200**; `accepted` stays parsed count). If `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL → still **200** `{denied:N}`.",
         "operationId": "postTraces",
         "security": [],
         "parameters": [
@@ -729,7 +775,7 @@
         },
         "responses": {
           "200": {
-            "description": "Spans parsed (`accepted`) including accepted:0 for empty. `denied` is the count of spans not stored because the tenant was already over `--tenant-budget` (0 when none). Over-budget deny may also fire the budget-breach webhook once per denied request.",
+            "description": "Spans parsed (`accepted`) including accepted:0 for empty. `denied` is the count of spans not stored because the tenant was already over `--tenant-budget` or the incoming cost would exceed it (0 when none). Over-budget deny may also fire the budget-breach webhook once per denied request.",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -855,7 +901,7 @@
         },
         "responses": {
           "200": {
-            "description": "Spans parsed (`accepted`) including accepted:0 for empty. `denied` is the count of spans not stored because the tenant was already over `--tenant-budget` (0 when none). Over-budget deny may also fire the budget-breach webhook once per denied request.",
+            "description": "Spans parsed (`accepted`) including accepted:0 for empty. `denied` is the count of spans not stored because the tenant was already over `--tenant-budget` or the incoming cost would exceed it (0 when none). Over-budget deny may also fire the budget-breach webhook once per denied request.",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -919,7 +965,7 @@
           "meta"
         ],
         "summary": "Prometheus metrics",
-        "description": "Prometheus text exposition of the cost snapshot (computed once at process start). Gauges: `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`. Counter: `otel_ai_cost_span_count`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Matching GET includes ACAO (same as other GET). Not rate-limited.",
+        "description": "Prometheus text exposition of the cost snapshot (computed once at process start). Gauges: `otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`. Counter: `otel_ai_cost_span_count`. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Matching GET includes ACAO (same as other GET). Not rate-limited.",
         "operationId": "getMetrics",
         "security": [],
         "responses": {
@@ -959,7 +1005,7 @@
           "meta"
         ],
         "summary": "OpenAPI 3 document",
-        "description": "File-backed spec from `openapi/cost.openapi.json`. CORS OPTIONS unlisted Origin \u2192 **403** `cors_denied`. Rate limit exceeded \u2192 **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
+        "description": "File-backed spec from `openapi/cost.openapi.json`. CORS OPTIONS unlisted Origin → **403** `cors_denied`. Rate limit exceeded → **429** `{ok:false, reason:\"rate_limited\"}` + `Retry-After`.",
         "operationId": "getOpenApi",
         "security": [],
         "responses": {
@@ -1019,7 +1065,7 @@
           "config"
         ],
         "summary": "Redacted runtime config",
-        "description": "Public snapshot of non-secret runtime **knobs** (not spend). Same auth as `GET /v1/budgets` (no token). Allowlist only: `spanCap` / `spansMax` (`--span-max` / `SPAN_MAX`, default 50000; 0 = unlimited), `rateLimit.perMinute` (null if unlimited), `cors.origins`, `pack` name or null, `hasGlobalBudget` (boolean \u2014 dollar amount stays on `/v1/budgets`), `tenantBudgetCount`, `webhooks.hasUrl` / `webhooks.hasSecret` (booleans \u2014 **never** the webhook URL, which may contain query tokens, and **never** the secret). **Forbidden:** webhook URL, webhook secret, ingest token, API keys, price table dump (see `GET /v1/models`). CORS + `X-Request-Id` same as other GET. Rate-limited like `/v1/budgets` (not a probe path).",
+        "description": "Public snapshot of non-secret runtime **knobs** (not spend). Same auth as `GET /v1/budgets` (no token). Allowlist only: `spanCap` / `spansMax` (`--span-max` / `SPAN_MAX`, default 50000; 0 = unlimited), `rateLimit.perMinute` (null if unlimited), `cors.origins`, `pack` name or null, `hasGlobalBudget` (boolean — dollar amount stays on `/v1/budgets`), `tenantBudgetCount`, `webhooks.hasUrl` / `webhooks.hasSecret` (booleans — **never** the webhook URL, which may contain query tokens, and **never** the secret). **Forbidden:** webhook URL, webhook secret, ingest token, API keys, price table dump (see `GET /v1/models`). CORS + `X-Request-Id` same as other GET. Rate-limited like `/v1/budgets` (not a probe path).",
         "operationId": "getConfig",
         "security": [],
         "parameters": [
@@ -1225,7 +1271,7 @@
         "properties": {
           "tenant": {
             "type": "string",
-            "description": "Span attribute `tenant`. Missing/empty \u2192 `_`.",
+            "description": "Span attribute `tenant`. Missing/empty → `_`.",
             "example": "acme"
           },
           "usd": {
@@ -1247,7 +1293,7 @@
       },
       "DailyReport": {
         "type": "object",
-        "description": "UTC daily cost rollup (serve default `--group-by day`). Includes `byTenant` from span attr `tenant` (missing/empty \u2192 `_`). `budgetBreaches` lists tenants whose `usd` exceeded `--tenant-budget` / `OTEL_AI_COST_TENANT_BUDGETS` (empty when unset). Global `--budget` totalUsd is independent.",
+        "description": "UTC daily cost rollup (serve default `--group-by day`). Includes `byTenant` from span attr `tenant` (missing/empty → `_`). `budgetBreaches` lists tenants whose `usd` exceeded `--tenant-budget` / `OTEL_AI_COST_TENANT_BUDGETS` (empty when unset). Global `--budget` totalUsd is independent.",
         "required": [
           "totalUsd"
         ],
@@ -1273,7 +1319,7 @@
           },
           "byTenant": {
             "type": "array",
-            "description": "Cost rollup by span attribute `tenant`. Missing/empty \u2192 `_`.",
+            "description": "Cost rollup by span attribute `tenant`. Missing/empty → `_`.",
             "items": {
               "$ref": "#/components/schemas/TenantBucket"
             }
@@ -1301,7 +1347,7 @@
       },
       "CorsConfig": {
         "type": "object",
-        "description": "Optional CORS. Default omitted or empty origins = no extra CORS headers (deny). `origins` may be `[\"*\"]` (any Origin) or an explicit list. When enabled with an explicit list, OPTIONS preflight for a non-listed Origin returns **403** `{error:\"forbidden\",reason:\"cors_denied\"}`; allowed Origin \u2192 **204** with ACAO/ACAM/ACAH. Matching GET get Access-Control-Allow-Origin. local-mvp uses `[\"http://localhost:3000\"]`. Default `Access-Control-Expose-Headers` includes `Retry-After` and `X-Request-Id`.",
+        "description": "Optional CORS. Default omitted or empty origins = no extra CORS headers (deny). `origins` may be `[\"*\"]` (any Origin) or an explicit list. When enabled with an explicit list, OPTIONS preflight for a non-listed Origin returns **403** `{error:\"forbidden\",reason:\"cors_denied\"}`; allowed Origin → **204** with ACAO/ACAM/ACAH. Matching GET get Access-Control-Allow-Origin. local-mvp uses `[\"http://localhost:3000\"]`. Default `Access-Control-Expose-Headers` includes `Retry-After` and `X-Request-Id`.",
         "properties": {
           "origins": {
             "type": "array",
@@ -1352,7 +1398,7 @@
         }
       },
       "Ready": {
-        "description": "GET /ready body. 200 `{ok:true, service}` plus the same snapshot fields as GET /health when healthy. 503 `{ok:false, reason:\"shutting_down\"}` while draining SIGTERM/SIGINT. Snapshot/stateless \u2014 no circuit or queue. Compose/stack-demo healthchecks stay on `/health`.",
+        "description": "GET /ready body. 200 `{ok:true, service}` plus the same snapshot fields as GET /health when healthy. 503 `{ok:false, reason:\"shutting_down\"}` while draining SIGTERM/SIGINT. Snapshot/stateless — no circuit or queue. Compose/stack-demo healthchecks stay on `/health`.",
         "allOf": [
           {
             "$ref": "#/components/schemas/Health"
@@ -1414,7 +1460,7 @@
           "denied": {
             "type": "integer",
             "minimum": 0,
-            "description": "Spans not stored because the tenant was already over `--tenant-budget`. 0 when none denied. HTTP stays 200.",
+            "description": "Spans not stored because the tenant was already over `--tenant-budget` or the incoming cost would exceed it. 0 when none denied. HTTP stays 200.",
             "example": 0
           }
         }
@@ -1442,7 +1488,7 @@
       },
       "Budgets": {
         "type": "object",
-        "description": "Configured budget thresholds (not spend). `globalUsd` is `--budget` `maxTotalUsd`. `tenants` maps tenant id \u2192 USD threshold from `--tenant-budget`. Missing \u2192 `null` / `{}`. No secrets.",
+        "description": "Configured budget thresholds (not spend). `globalUsd` is `--budget` `maxTotalUsd`. `tenants` maps tenant id → USD threshold from `--tenant-budget`. Missing → `null` / `{}`. No secrets.",
         "required": [
           "ok",
           "globalUsd",
@@ -1559,7 +1605,7 @@
       },
       "RuntimeConfig": {
         "type": "object",
-        "description": "Public redacted runtime config (GET /v1/config). Allowlist only \u2014 never webhook URL, webhook secret, ingest token, API keys, or the price table. Knobs, not spend (dollar thresholds stay on GET /v1/budgets; rates stay on GET /v1/models). Mirrors B GET /admin/config and C/F GET /v1/config; E has no admin token on this GET.",
+        "description": "Public redacted runtime config (GET /v1/config). Allowlist only — never webhook URL, webhook secret, ingest token, API keys, or the price table. Knobs, not spend (dollar thresholds stay on GET /v1/budgets; rates stay on GET /v1/models). Mirrors B GET /admin/config and C/F GET /v1/config; E has no admin token on this GET.",
         "required": [
           "ok",
           "spanCap",
@@ -1625,7 +1671,7 @@
           },
           "webhooks": {
             "type": "object",
-            "description": "Outbound budget-breach webhook presence. Booleans only \u2014 never the URL (query tokens) or secret.",
+            "description": "Outbound budget-breach webhook presence. Booleans only — never the URL (query tokens) or secret.",
             "required": [
               "hasUrl",
               "hasSecret"
@@ -1670,7 +1716,7 @@
           },
           "tenant": {
             "type": "string",
-            "description": "Span attribute `tenant` (missing/empty \u2192 `_`).",
+            "description": "Span attribute `tenant` (missing/empty → `_`).",
             "example": "acme"
           },
           "inputTokens": {
@@ -1686,13 +1732,13 @@
           "usd": {
             "type": "number",
             "format": "double",
-            "description": "Estimated USD from the loaded price table (same as spanCost.usd).",
+            "description": "USD for this span: `gen_ai.cost.usd` if present (finite ≥ 0), else tokens × price table (same as spanCost.usd).",
             "example": 0.00042
           },
           "ts": {
             "type": "string",
             "nullable": true,
-            "description": "ISO-8601 from `timestamp` / `startTimeUnixNano` (same fields as spanUtcDay). Missing \u2192 null.",
+            "description": "ISO-8601 from `timestamp` / `startTimeUnixNano` (same fields as spanUtcDay). Missing → null.",
             "example": "2024-08-11T00:00:00.000Z"
           }
         }
@@ -1739,7 +1785,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "Tenant id from span attribute `tenant` (missing/empty \u2192 `_`).",
+            "description": "Tenant id from span attribute `tenant` (missing/empty → `_`).",
             "example": "acme"
           },
           "spanCount": {
@@ -1839,7 +1885,7 @@
         }
       },
       "Unauthorized": {
-        "description": "Ingest token is configured (`INGEST_TOKEN` / `--ingest-token`) but `Authorization: Bearer` is missing or does not match. Body `{error:\"unauthorized\"}` \u2014 never echoes the token. Default token unset \u2192 this 401 is not returned.",
+        "description": "Ingest token is configured (`INGEST_TOKEN` / `--ingest-token`) but `Authorization: Bearer` is missing or does not match. Body `{error:\"unauthorized\"}` — never echoes the token. Default token unset → this 401 is not returned.",
         "headers": {
           "X-Request-Id": {
             "$ref": "#/components/headers/XRequestId"
@@ -1897,7 +1943,7 @@
         "name": "format",
         "in": "query",
         "required": false,
-        "description": "Export format. `json` (default) = DailyReport JSON (same as `/report.json`). `csv` = finance CSV (`date,model,spanCount,usd,tenant`, same as `/v1/costs.csv`). `md` = FinOps Markdown (same as `/v1/costs.md`; Slack / email / `$GITHUB_STEP_SUMMARY`). `gha` = GitHub Actions workflow commands (`text/plain`; alias `annotations`; path alias `GET /v1/costs.gha.txt`; `::error title=budget` / `::error title=tenant/<id>`; no breach \u2192 empty).",
+        "description": "Export format. `json` (default) = DailyReport JSON (same as `/report.json`). `csv` = finance CSV (`date,model,spanCount,usd,tenant`, same as `/v1/costs.csv`). `md` = FinOps Markdown (same as `/v1/costs.md`; Slack / email / `$GITHUB_STEP_SUMMARY`). `gha` = GitHub Actions workflow commands (`text/plain`; alias `annotations`; path alias `GET /v1/costs.gha.txt`; `::error title=budget` / `::error title=tenant/<id>`; no breach → empty).",
         "schema": {
           "type": "string",
           "enum": [
@@ -1914,7 +1960,7 @@
         "name": "tenant",
         "in": "query",
         "required": false,
-        "description": "Exact tenant id filter (one id). Unknown \u2192 **200** `{ok:true, count:0, tenants:[]}`.",
+        "description": "Exact tenant id filter (one id). Unknown → **200** `{ok:true, count:0, tenants:[]}`.",
         "schema": {
           "type": "string",
           "example": "acme"

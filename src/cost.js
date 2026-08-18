@@ -28,15 +28,34 @@ export function spanTenant(span) {
   return s || UNKNOWN_TENANT;
 }
 
+/** Span attribute for an incoming USD amount if present. Not a shipped OTel convention. */
+export const COST_USD_ATTR = "gen_ai.cost.usd";
+
+/**
+ * Incoming USD from `gen_ai.cost.usd` if present and a finite number ≥ 0.
+ * Missing / invalid (non-numeric, negative, NaN, Infinity) → null so callers
+ * keep today's token × price path. Does not invent a semantic convention.
+ */
+export function spanCostUsdAttr(span) {
+  const raw = span?.attributes?.[COST_USD_ATTR];
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "boolean" || typeof raw === "object") return null;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Number(n.toFixed(6));
+}
+
 export function spanCost(span, prices = DEFAULT_PRICES) {
   const model = span.attributes?.["gen_ai.request.model"] || span.model || "unknown";
   const inTok = Number(span.attributes?.["gen_ai.usage.input_tokens"] ?? span.inputTokens ?? 0);
   const outTok = Number(span.attributes?.["gen_ai.usage.output_tokens"] ?? span.outputTokens ?? 0);
   const p = prices[model] || { inputPerMTok: 1, outputPerMTok: 3 };
-  const usd = (inTok / 1e6) * p.inputPerMTok + (outTok / 1e6) * p.outputPerMTok;
+  const tokenUsd = (inTok / 1e6) * p.inputPerMTok + (outTok / 1e6) * p.outputPerMTok;
+  const attrUsd = spanCostUsdAttr(span);
+  const usd = attrUsd != null ? attrUsd : Number(tokenUsd.toFixed(6));
   const day = spanUtcDay(span);
   const tenant = spanTenant(span);
-  return { model, inTok, outTok, usd: Number(usd.toFixed(6)), day, tenant };
+  return { model, inTok, outTok, usd, day, tenant };
 }
 
 /** Extract UTC calendar day (YYYY-MM-DD) from common OTel / example timestamp fields. */
@@ -277,29 +296,212 @@ export function tenantBudgetRemaining(byTenant, budgets) {
   return out;
 }
 
+export const ENV_DENY_ON_WOULD_EXCEED = "DENY_ON_WOULD_EXCEED";
+
+function parseBoolFlag(raw) {
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "boolean") return raw;
+  const s = String(raw).trim().toLowerCase();
+  if (s === "false" || s === "0" || s === "off" || s === "no" || s === "disabled") return false;
+  if (s === "true" || s === "1" || s === "on" || s === "yes") return true;
+  return null;
+}
+
+/**
+ * CLI wins when provided; else env DENY_ON_WOULD_EXCEED; default true.
+ * false / 0 / off / no restores deny-only-after-already-over.
+ */
+export function resolveDenyOnWouldExceed(cliValue, env = process.env) {
+  if (cliValue !== null && cliValue !== undefined) {
+    const v = parseBoolFlag(cliValue);
+    return v == null ? Boolean(cliValue) : v;
+  }
+  const environ = env && typeof env === "object" ? env : {};
+  const v = parseBoolFlag(environ[ENV_DENY_ON_WOULD_EXCEED]);
+  return v == null ? true : v;
+}
+
+export const ENV_BUDGET_PERIOD = "BUDGET_PERIOD";
+export const ENV_BUDGET_PERIOD_ALIAS = "OTEL_AI_COST_BUDGET_PERIOD";
+export const BUDGET_PERIOD_DAY = "day";
+
+function normalizeBudgetPeriod(raw) {
+  if (raw == null || raw === "") return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === "off" || s === "all" || s === "none" || s === "cumulative" || s === "false" || s === "0") {
+    return null;
+  }
+  if (s === "day" || s === "daily" || s === "utc-day") return BUDGET_PERIOD_DAY;
+  return null;
+}
+
+/**
+ * CLI `--budget-period` wins when provided (including empty/off to disable);
+ * else env BUDGET_PERIOD (alias OTEL_AI_COST_BUDGET_PERIOD); default off (null).
+ * Only `day` is supported — remaining / deny / would-exceed use the current UTC calendar day.
+ */
+export function resolveBudgetPeriod(cliValue, env = process.env) {
+  if (cliValue !== null && cliValue !== undefined) {
+    return normalizeBudgetPeriod(cliValue);
+  }
+  const environ = env && typeof env === "object" ? env : {};
+  const raw = environ[ENV_BUDGET_PERIOD] ?? environ[ENV_BUDGET_PERIOD_ALIAS];
+  return normalizeBudgetPeriod(raw);
+}
+
+/** UTC calendar day YYYY-MM-DD for `now` (ms or Date). */
+export function utcToday(now = Date.now()) {
+  const ms = now instanceof Date ? now.getTime() : Number(now);
+  const d = new Date(Number.isFinite(ms) ? ms : Date.now());
+  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Stamp ingest time so a span without its own timestamp can fall into the
+ * current UTC day window later (midnight reset). Does not overwrite an existing stamp.
+ */
+export function stampIngestTime(span, now = Date.now()) {
+  if (!span || typeof span !== "object") return span;
+  if (span._ingestTime == null && span.ingestTime == null) {
+    span._ingestTime = now instanceof Date ? now.getTime() : Number(now);
+  }
+  return span;
+}
+
+/**
+ * Day used for the optional budget period window.
+ * Span time first; else ingest stamp; else `now` (ingest time).
+ */
+export function spanPeriodDay(span, now = Date.now()) {
+  const day = spanUtcDay(span);
+  if (day && day !== "unknown") return day;
+  const ingest = span?._ingestTime ?? span?.ingestTime;
+  if (ingest != null && ingest !== "") {
+    const fromIngest = spanUtcDay({ timestamp: ingest });
+    if (fromIngest && fromIngest !== "unknown") return fromIngest;
+  }
+  return utcToday(now);
+}
+
+/** Spans whose period-day is the current UTC day. Period off → same list. */
+export function spansInBudgetPeriod(spans, period, now = Date.now()) {
+  const list = Array.isArray(spans) ? spans : [];
+  if (normalizeBudgetPeriod(period) !== BUDGET_PERIOD_DAY) return list;
+  const today = utcToday(now);
+  return list.filter((s) => spanPeriodDay(s, now) === today);
+}
+
+function tenantSpendMap(spans, prices = DEFAULT_PRICES) {
+  const spend = new Map();
+  for (const span of Array.isArray(spans) ? spans : []) {
+    const cost = spanCost(span, prices);
+    const tenant = cost.tenant || UNKNOWN_TENANT;
+    spend.set(tenant, (spend.get(tenant) || 0) + (Number(cost.usd) || 0));
+  }
+  return spend;
+}
+
+function spendMapFromReport(reportResult, period, now, prices, store) {
+  if (normalizeBudgetPeriod(period) === BUDGET_PERIOD_DAY) {
+    if (Array.isArray(store)) {
+      return tenantSpendMap(spansInBudgetPeriod(store, period, now), prices);
+    }
+    const today = utcToday(now);
+    const spend = new Map();
+    for (const row of reportResult?.rows || []) {
+      const day = row?.day && row.day !== "unknown" ? row.day : today;
+      if (day !== today) continue;
+      const tenant = row?.tenant || UNKNOWN_TENANT;
+      spend.set(tenant, (spend.get(tenant) || 0) + (Number(row?.usd) || 0));
+    }
+    return spend;
+  }
+  const spend = new Map();
+  for (const row of reportResult?.byTenant || []) {
+    spend.set(row?.tenant || UNKNOWN_TENANT, Number(row?.usd) || 0);
+  }
+  return spend;
+}
+
+/**
+ * True when current + incoming is strictly greater than budget (6-decimal).
+ * Exact equality is allowed. Non-finite budget → false.
+ */
+export function wouldExceedBudget(currentUsd, incomingUsd, budgetUsd) {
+  const budget = Number(budgetUsd);
+  if (!Number.isFinite(budget)) return false;
+  const current = Number(currentUsd);
+  const incoming = Number(incomingUsd);
+  const c = Number.isFinite(current) ? current : 0;
+  const i = Number.isFinite(incoming) ? incoming : 0;
+  return Number((c + i).toFixed(6)) > budget;
+}
+
 /**
  * Split incoming spans into kept vs budget-denied.
  * A tenant already in breach (`usd` > budget) is denied further ingest.
+ * Default (deny-on-would-exceed): also deny when `current + incoming > budget`
+ * (exact-on-budget is allowed). Set `{ denyOnWouldExceed: false }` or
+ * `DENY_ON_WOULD_EXCEED=false` to restore deny-only-after-already-over.
  * `_` is not gated unless `_` is explicitly budgeted (same as tenantBudgetBreaches).
  * Does not mutate spans. Empty/invalid → `{ kept: [], denied: 0, deniedSpans: [] }`.
  */
-export function applyBudgetDeny(spans, reportResult, tenantBudgets) {
+export function applyBudgetDeny(spans, reportResult, tenantBudgets, opts = {}) {
   const list = Array.isArray(spans) ? spans : [];
-  const breaches = Array.isArray(reportResult?.budgetBreaches)
-    ? reportResult.budgetBreaches
-    : tenantBudgetBreaches(reportResult?.byTenant || [], tenantBudgets);
-  const breached = new Set();
+  const map = normalizeTenantBudgetMap(tenantBudgets);
+  const denyOnWouldExceed =
+    opts && typeof opts === "object" && opts.denyOnWouldExceed === false ? false : true;
+  const prices =
+    opts && opts.prices && typeof opts.prices === "object" && !Array.isArray(opts.prices)
+      ? opts.prices
+      : DEFAULT_PRICES;
+  const period = opts && typeof opts === "object" ? normalizeBudgetPeriod(opts.period ?? opts.budgetPeriod) : null;
+  const now = opts && opts.now != null ? opts.now : Date.now();
+  const store = opts && Array.isArray(opts.store) ? opts.store : null;
+  const dayWindow = period === BUDGET_PERIOD_DAY;
+  const today = utcToday(now);
+  const spend = spendMapFromReport(reportResult, period, now, prices, store);
+  const breaches = dayWindow
+    ? tenantBudgetBreaches(
+        [...spend.entries()].map(([tenant, usd]) => ({
+          tenant,
+          usd: Number(Number(usd).toFixed(6)),
+        })),
+        tenantBudgets
+      )
+    : Array.isArray(reportResult?.budgetBreaches)
+      ? reportResult.budgetBreaches
+      : tenantBudgetBreaches(reportResult?.byTenant || [], tenantBudgets);
+  const blocked = new Set();
   for (const b of breaches || []) {
-    breached.add(b?.tenant || UNKNOWN_TENANT);
+    blocked.add(b?.tenant || UNKNOWN_TENANT);
   }
-  if (!breached.size) {
+  if (denyOnWouldExceed) {
+    const incomingByTenant = new Map();
+    for (const span of list) {
+      const tenant = spanTenant(span);
+      if (!Object.prototype.hasOwnProperty.call(map, tenant)) continue;
+      if (dayWindow && spanPeriodDay(span, now) !== today) continue;
+      incomingByTenant.set(
+        tenant,
+        (incomingByTenant.get(tenant) || 0) + (Number(spanCost(span, prices).usd) || 0)
+      );
+    }
+    for (const [tenant, incoming] of incomingByTenant) {
+      const current = spend.has(tenant) ? spend.get(tenant) : 0;
+      if (wouldExceedBudget(current, incoming, map[tenant])) blocked.add(tenant);
+    }
+  }
+  if (!blocked.size) {
     return { kept: list.slice(), denied: 0, deniedSpans: [] };
   }
   const kept = [];
   const deniedSpans = [];
   for (const span of list) {
     const tenant = spanTenant(span);
-    if (breached.has(tenant)) deniedSpans.push(span);
+    const inWindow = !dayWindow || spanPeriodDay(span, now) === today;
+    if (blocked.has(tenant) && inWindow) deniedSpans.push(span);
     else kept.push(span);
   }
   return { kept, denied: deniedSpans.length, deniedSpans };
@@ -577,7 +779,11 @@ function isTenantsJsonOpts(obj) {
     "budgets" in obj ||
     "tenantBudgets" in obj ||
     "tenant" in obj ||
-    "limit" in obj
+    "limit" in obj ||
+    "denyByTenant" in obj ||
+    "period" in obj ||
+    "budgetPeriod" in obj ||
+    "now" in obj
   );
 }
 
@@ -623,8 +829,21 @@ export function tenantsJson(store, budgets = null, cap = TENANT_LIST_CAP) {
   }
 
   const buf = Array.isArray(store) ? store : [];
+  let period = null;
+  let now = Date.now();
+  if (isTenantsJsonOpts(budgets)) {
+    period = resolveBudgetPeriod(budgets.period ?? budgets.budgetPeriod ?? null, {});
+    if (budgets.now != null) now = budgets.now;
+  }
+  const counted = spansInBudgetPeriod(buf, period, now);
   const map = new Map();
-  for (const span of buf) {
+  if (period === BUDGET_PERIOD_DAY) {
+    for (const span of buf) {
+      const id = spanTenant(span);
+      if (!map.has(id)) map.set(id, { id, usd: 0, spanCount: 0 });
+    }
+  }
+  for (const span of counted) {
     const cost = spanCost(span, prices);
     const id = cost.tenant || UNKNOWN_TENANT;
     if (!map.has(id)) map.set(id, { id, usd: 0, spanCount: 0 });
@@ -661,6 +880,51 @@ export function tenantsJson(store, budgets = null, cap = TENANT_LIST_CAP) {
   const out = { ok: true, count, tenants };
   if (truncated) out.truncated = true;
   return out;
+}
+
+export const TENANT_CSV_COLUMNS = ["tenant", "spend_usd", "budget_usd", "remaining_usd", "denied_count"];
+
+function denyCountMap(raw) {
+  if (raw == null) return {};
+  if (raw instanceof Map) return Object.fromEntries(raw);
+  if (typeof raw === "object" && !Array.isArray(raw)) return raw;
+  return {};
+}
+
+/**
+ * Chargeback-lite CSV from in-memory tenant totals (GET /v1/tenants.csv).
+ * Header `tenant,spend_usd,budget_usd,remaining_usd,denied_count`.
+ * Empty store → header only. Missing tenant → `_`.
+ * budget_usd / remaining_usd blank when that tenant has no configured budget.
+ * remaining = budget - spend (may be negative; same as tenantBudgetRemaining).
+ * denied_count from the ingest deny map (0 if none). Do not invent extra series.
+ */
+export function formatTenantsCsv(store, opts = {}) {
+  const list = tenantsJson(store, opts);
+  const denies = denyCountMap(opts && (opts.denyByTenant ?? opts.denied));
+  const lines = [TENANT_CSV_COLUMNS.join(",")];
+  for (const t of list.tenants || []) {
+    const spend = Number(t.usd) || 0;
+    const hasBudget =
+      t != null &&
+      Object.prototype.hasOwnProperty.call(t, "budgetUsd") &&
+      t.budgetUsd != null &&
+      Number.isFinite(Number(t.budgetUsd));
+    const budget = hasBudget ? Number(t.budgetUsd) : null;
+    const remaining = hasBudget ? Number((budget - spend).toFixed(6)) : "";
+    const deniedRaw = denies[t.id];
+    const denied = Number.isFinite(Number(deniedRaw)) ? Math.floor(Number(deniedRaw)) : 0;
+    lines.push(
+      [
+        csvEscape(t.id ?? UNKNOWN_TENANT),
+        spend.toFixed(6),
+        hasBudget ? Number(budget).toFixed(6) : "",
+        remaining === "" ? "" : Number(remaining).toFixed(6),
+        String(denied),
+      ].join(",")
+    );
+  }
+  return lines.join("\n") + "\n";
 }
 
 export function report(spans, prices = DEFAULT_PRICES, opts = {}) {

@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "otel_ai_cost_local_serve_api": {
+      "command": "node",
+      "args": [
+        "./mcp-server.mjs"
+      ],
+      "env": {
+        "MCP_BASE_URL": "http://127.0.0.1:8792"
+      }
+    },
+    "otel_ai_cost_local_serve_api-py": {
+      "command": "python3",
+      "args": [
+        "./mcp_server.py"
+      ],
+      "env": {
+        "MCP_BASE_URL": "http://127.0.0.1:8792"
+      }
+    },
+    "otel_ai_cost_local_serve_api-go": {
+      "command": "go",
+      "args": [
+        "run",
+        "./mcp_server.go"
+      ],
+      "env": {
+        "MCP_BASE_URL": "http://127.0.0.1:8792"
+      }
+    }
+  }
+}

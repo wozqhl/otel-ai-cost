@@ -716,10 +716,10 @@ node -e '
 const spec=require("./out/serve-openapi.json");
 if(!String(spec.openapi||"").startsWith("3.")) { console.error("openapi version", spec.openapi); process.exit(1); }
 const paths=spec.paths||{};
-const need=["/health","/ready","/","/report.json","/v1/costs.csv","/v1/costs.md","/v1/costs.gha.txt","/v1/costs","/v1/budgets","/v1/models","/v1/config","/v1/spans","/v1/tenants","/metrics","/openapi.json"];
+const need=["/health","/ready","/","/report.json","/v1/costs.csv","/v1/costs.md","/v1/costs.gha.txt","/v1/costs","/v1/budgets","/v1/models","/v1/config","/v1/spans","/v1/tenants","/v1/tenants.csv","/metrics","/openapi.json"];
 const missing=need.filter((p)=>!paths[p] || !paths[p].get);
 if(missing.length) { console.error("missing paths", missing); process.exit(1); }
-for (const p of ["/health","/ready","/","/report.json","/v1/costs.csv","/v1/costs.md","/v1/costs.gha.txt","/v1/costs","/v1/budgets","/v1/models","/v1/config","/v1/spans","/v1/tenants","/metrics"]) {
+for (const p of ["/health","/ready","/","/report.json","/v1/costs.csv","/v1/costs.md","/v1/costs.gha.txt","/v1/costs","/v1/budgets","/v1/models","/v1/config","/v1/spans","/v1/tenants","/v1/tenants.csv","/metrics"]) {
   const resp=(paths[p].get.responses||{});
   if(!resp["403"]) { console.error("missing 403 CORS", p, Object.keys(resp)); process.exit(1); }
 }
@@ -747,6 +747,7 @@ if(((paths["/v1/models"]||{}).get||{}).operationId!=="getModels") process.exit(1
 if(((paths["/v1/config"]||{}).get||{}).operationId!=="getConfig") process.exit(1);
 if(((paths["/v1/spans"]||{}).get||{}).operationId!=="listSpans") process.exit(1);
 if(((paths["/v1/tenants"]||{}).get||{}).operationId!=="listTenants") process.exit(1);
+if(((paths["/v1/tenants.csv"]||{}).get||{}).operationId!=="getTenantsCsv") process.exit(1);
 if(((paths["/"]||{}).get||{}).operationId!=="getIndex") process.exit(1);
 if(((paths["/openapi.json"]||{}).get||{}).operationId!=="getOpenApi") process.exit(1);
 if(((paths["/metrics"]||{}).get||{}).operationId!=="getMetrics") process.exit(1);
@@ -1633,7 +1634,272 @@ INGEST_DENY_WH_PID=""
 trap - EXIT
 echo "==> [ingest-deny-webhook] isolated mock receiver POST + no-URL 200 denied:1 OK"
 
+echo "==> [would-exceed] tenant just under budget; incoming that would cross is denied (spend unchanged + webhook)"
+WOULD_PORT="${WOULD_PORT:-8845}"
+WOULD_WH_PORT="${WOULD_WH_PORT:-8846}"
+WOULD_SPANS="$ROOT/out/would-exceed-spans.json"
+WOULD_LOG="$ROOT/out/would-exceed-serve.log"
+WOULD_WH_OUT="$ROOT/out/would-exceed-webhook-last.json"
+WOULD_WH_HDR="$ROOT/out/would-exceed-webhook-last.headers.json"
+WOULD_WH_LOG="$ROOT/out/would-exceed-webhook.log"
+rm -f "$WOULD_LOG" "$WOULD_WH_OUT" "$WOULD_WH_HDR" "$WOULD_WH_LOG" \
+  out/would-exceed-post.json out/would-exceed-costs-before.json out/would-exceed-costs-after.json
+# gpt-4o-mini 1000 in / 0 out = $0.000150; budget $0.000200 (just under)
+printf '%s\n' '[{"timestamp":"2024-08-18T00:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":1000,"gen_ai.usage.output_tokens":0,"tenant":"acme"}}]' > "$WOULD_SPANS"
+unset OTEL_AI_COST_WEBHOOK_URL OTEL_AI_COST_WEBHOOK_SECRET || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset INGEST_TOKEN RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM DENY_ON_WOULD_EXCEED BUDGET_PERIOD OTEL_AI_COST_BUDGET_PERIOD || true
+
+node mock-webhook-receiver.js --port "$WOULD_WH_PORT" --out "$WOULD_WH_OUT" \
+  --headers-out "$WOULD_WH_HDR" --secret "whsec_would_exceed_mvp" >"$WOULD_WH_LOG" 2>&1 &
+WOULD_WH_PID=$!
+node src/cli.js serve --port "$WOULD_PORT" --in "$WOULD_SPANS" \
+  --tenant-budget "acme=0.0002" \
+  --webhook-url "http://127.0.0.1:${WOULD_WH_PORT}/hook" \
+  --webhook-secret "whsec_would_exceed_mvp" >"$WOULD_LOG" 2>&1 &
+WOULD_PID=$!
+cleanup_would() {
+  if [ -n "${WOULD_PID:-}" ] && kill -0 "$WOULD_PID" 2>/dev/null; then
+    kill "$WOULD_PID" 2>/dev/null || true
+    wait "$WOULD_PID" 2>/dev/null || true
+  fi
+  if [ -n "${WOULD_WH_PID:-}" ] && kill -0 "$WOULD_WH_PID" 2>/dev/null; then
+    kill "$WOULD_WH_PID" 2>/dev/null || true
+    wait "$WOULD_WH_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_would EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$WOULD_WH_PORT/health" >/dev/null \
+    && curl -sf "http://127.0.0.1:$WOULD_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "would-exceed serve did not become healthy"
+    cat "$WOULD_WH_LOG" || true
+    cat "$WOULD_LOG" || true
+    exit 1
+  fi
+done
+curl -sf "http://127.0.0.1:$WOULD_PORT/v1/costs" -o out/would-exceed-costs-before.json
+WOULD_POST="$(curl -s -o out/would-exceed-post.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$WOULD_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-08-18T01:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":1000,"gen_ai.usage.output_tokens":0,"tenant":"acme","gen_ai.prompt":"SECRET_PROMPT_WOULD_EXCEED"}}]}')"
+echo "would_exceed_status=$WOULD_POST body=$(cat out/would-exceed-post.json)"
+test "$WOULD_POST" = "200"
+grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' out/would-exceed-post.json
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/would-exceed-post.json
+curl -sf "http://127.0.0.1:$WOULD_PORT/v1/costs" -o out/would-exceed-costs-after.json
+test -s "$WOULD_WH_OUT"
+node -e '
+const fs=require("fs");
+const before=JSON.parse(fs.readFileSync("out/would-exceed-costs-before.json","utf8"));
+const after=JSON.parse(fs.readFileSync("out/would-exceed-costs-after.json","utf8"));
+const hook=JSON.parse(fs.readFileSync("out/would-exceed-webhook-last.json","utf8"));
+const meta=JSON.parse(fs.readFileSync("out/would-exceed-webhook-last.headers.json","utf8"));
+const acmeB=(before.byTenant||[]).find((t)=>t.tenant==="acme");
+const acmeA=(after.byTenant||[]).find((t)=>t.tenant==="acme");
+if(!acmeB || Number(acmeB.usd)!==0.00015) { console.error("expected under-budget seed 0.00015", before.byTenant); process.exit(1); }
+if(Number(acmeA && acmeA.usd)!==Number(acmeB.usd)) { console.error("spend must be unchanged", acmeB, acmeA); process.exit(1); }
+const blob=JSON.stringify(hook);
+if(hook.ok!==false || hook.tenant!=="acme" || Number(hook.denied)!==1 || Number(hook.budget)!==0.0002 || Number(hook.spend)!==Number(acmeB.usd)) {
+  console.error("would-exceed webhook payload", hook); process.exit(1);
+}
+if(blob.includes("SECRET_PROMPT_WOULD_EXCEED") || blob.includes("gen_ai.prompt")) {
+  console.error("would-exceed webhook leaked prompt", hook); process.exit(1);
+}
+if(meta.verified!==true || !meta.timestamp) {
+  console.error("would-exceed webhook HMAC/timestamp", meta); process.exit(1);
+}
+console.log("would-exceed-ok", {spend:acmeA.usd, budget:hook.budget, denied:hook.denied});
+'
+cleanup_would
+WOULD_PID=""
+WOULD_WH_PID=""
+trap - EXIT
+echo "==> [would-exceed] isolated deny + spend unchanged + webhook OK"
+
+echo "==> [cost-attr] one span with gen_ai.cost.usd; spend matches attribute (not token math)"
+ATTR_PORT="${ATTR_PORT:-8847}"
+ATTR_SPANS="$ROOT/out/cost-attr-spans.json"
+ATTR_LOG="$ROOT/out/cost-attr-serve.log"
+rm -f "$ATTR_LOG" out/cost-attr-post.json out/cost-attr-costs.json
+# gpt-4o-mini 1000 in / 0 out = $0.000150; attribute is $1.23
+printf '%s\n' '[]' > "$ATTR_SPANS"
+unset OTEL_AI_COST_WEBHOOK_URL OTEL_AI_COST_WEBHOOK_SECRET || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset INGEST_TOKEN RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM DENY_ON_WOULD_EXCEED BUDGET_PERIOD OTEL_AI_COST_BUDGET_PERIOD || true
+node src/cli.js serve --port "$ATTR_PORT" --in "$ATTR_SPANS" >"$ATTR_LOG" 2>&1 &
+ATTR_PID=$!
+cleanup_attr() {
+  if [ -n "${ATTR_PID:-}" ] && kill -0 "$ATTR_PID" 2>/dev/null; then
+    kill "$ATTR_PID" 2>/dev/null || true
+    wait "$ATTR_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_attr EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$ATTR_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "cost-attr serve did not become healthy"
+    cat "$ATTR_LOG" || true
+    exit 1
+  fi
+done
+ATTR_POST="$(curl -s -o out/cost-attr-post.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$ATTR_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-08-18T00:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","gen_ai.usage.input_tokens":1000,"gen_ai.usage.output_tokens":0,"tenant":"acme","gen_ai.cost.usd":1.23}}]}')"
+echo "cost_attr_status=$ATTR_POST body=$(cat out/cost-attr-post.json)"
+test "$ATTR_POST" = "200"
+grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' out/cost-attr-post.json
+curl -sf "http://127.0.0.1:$ATTR_PORT/v1/costs" -o out/cost-attr-costs.json
+node -e '
+const fs=require("fs");
+const costs=JSON.parse(fs.readFileSync("out/cost-attr-costs.json","utf8"));
+const acme=(costs.byTenant||[]).find((t)=>t.tenant==="acme");
+if(Number(costs.totalUsd)!==1.23) { console.error("spend must match gen_ai.cost.usd=1.23 not token math 0.00015", costs); process.exit(1); }
+if(!acme || Number(acme.usd)!==1.23) { console.error("acme spend must match gen_ai.cost.usd", acme); process.exit(1); }
+console.log("cost-attr-ok", {totalUsd:costs.totalUsd, tenantUsd:acme.usd});
+'
+cleanup_attr
+ATTR_PID=""
+trap - EXIT
+echo "==> [cost-attr] isolated ingest spend matches gen_ai.cost.usd OK"
+
+echo "==> [export] ingest two tenants + GET /v1/tenants.csv header+rows"
+EXPORT_PORT="${EXPORT_PORT:-8848}"
+EXPORT_SPANS="$ROOT/out/export-spans.json"
+EXPORT_LOG="$ROOT/out/export-serve.log"
+printf '%s\n' '[]' > "$EXPORT_SPANS"
+rm -f "$EXPORT_LOG" out/export-post.json out/export-tenants.csv out/export-tenants.json
+unset OTEL_AI_COST_WEBHOOK_URL OTEL_AI_COST_WEBHOOK_SECRET || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset INGEST_TOKEN RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM DENY_ON_WOULD_EXCEED BUDGET_PERIOD OTEL_AI_COST_BUDGET_PERIOD || true
+node src/cli.js serve --port "$EXPORT_PORT" --in "$EXPORT_SPANS" \
+  --tenant-budget "acme=10,other=5" >"$EXPORT_LOG" 2>&1 &
+EXPORT_PID=$!
+cleanup_export() {
+  if [ -n "${EXPORT_PID:-}" ] && kill -0 "$EXPORT_PID" 2>/dev/null; then
+    kill "$EXPORT_PID" 2>/dev/null || true
+    wait "$EXPORT_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_export EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$EXPORT_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "export serve did not become healthy"
+    cat "$EXPORT_LOG" || true
+    exit 1
+  fi
+done
+EXPORT_POST="$(curl -s -o out/export-post.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$EXPORT_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-08-18T00:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","tenant":"acme","gen_ai.cost.usd":1}},{"timestamp":"2024-08-18T00:00:01.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","tenant":"other","gen_ai.cost.usd":2}}]}')"
+echo "export_status=$EXPORT_POST body=$(cat out/export-post.json)"
+test "$EXPORT_POST" = "200"
+curl -sf "http://127.0.0.1:$EXPORT_PORT/v1/tenants" -o out/export-tenants.json
+EXPORT_CSV_CODE="$(curl -s -o out/export-tenants.csv -D out/export-tenants-csv.h -w "%{http_code}" \
+  "http://127.0.0.1:$EXPORT_PORT/v1/tenants.csv" -H "X-Request-Id: mvp-export-rid")"
+test "$EXPORT_CSV_CODE" = "200"
+grep -qiE "^content-type:[[:space:]]*text/csv" out/export-tenants-csv.h
+node -e '
+const fs=require("fs");
+const json=JSON.parse(fs.readFileSync("out/export-tenants.json","utf8"));
+const csv=fs.readFileSync("out/export-tenants.csv","utf8");
+const lines=csv.trim().split("\n");
+const ids=(json.tenants||[]).map((t)=>t.id);
+if(json.ok!==true || json.count!==2 || !ids.includes("acme") || !ids.includes("other")) {
+  console.error("export json tenants", json); process.exit(1);
+}
+if(lines[0]!=="tenant,spend_usd,budget_usd,remaining_usd,denied_count") {
+  console.error("export csv header", lines[0]); process.exit(1);
+}
+if(lines.length!==3) { console.error("export csv rows", lines); process.exit(1); }
+if(!lines.some((l)=>l.startsWith("acme,1.000000,10.000000,9.000000,"))) {
+  console.error("export missing acme row", lines); process.exit(1);
+}
+if(!lines.some((l)=>l.startsWith("other,2.000000,5.000000,3.000000,"))) {
+  console.error("export missing other row", lines); process.exit(1);
+}
+console.log("export-ok", {header:lines[0], rows:lines.length-1, tenants:ids});
+'
+cleanup_export
+EXPORT_PID=""
+trap - EXIT
+echo "==> [export] isolated two-tenant CSV OK"
+
+
+echo "==> [period] UTC-day window: old timestamp ignored, today counts, remaining/deny match"
+PERIOD_PORT="${PERIOD_PORT:-8849}"
+PERIOD_SPANS="$ROOT/out/period-spans.json"
+PERIOD_LOG="$ROOT/out/period-serve.log"
+printf '%s\n' '[]' > "$PERIOD_SPANS"
+rm -f "$PERIOD_LOG" out/period-old.json out/period-today.json out/period-deny.json out/period-tenants.csv
+unset OTEL_AI_COST_WEBHOOK_URL OTEL_AI_COST_WEBHOOK_SECRET || true
+unset OTEL_AI_COST_TENANT_BUDGETS TENANT_BUDGETS || true
+unset INGEST_TOKEN RATE_LIMIT_PER_MINUTE RATE_LIMIT_RPM DENY_ON_WOULD_EXCEED BUDGET_PERIOD OTEL_AI_COST_BUDGET_PERIOD || true
+node src/cli.js serve --port "$PERIOD_PORT" --in "$PERIOD_SPANS" \
+  --tenant-budget "acme=2" --budget-period day >"$PERIOD_LOG" 2>&1 &
+PERIOD_PID=$!
+cleanup_period() {
+  if [ -n "${PERIOD_PID:-}" ] && kill -0 "$PERIOD_PID" 2>/dev/null; then
+    kill "$PERIOD_PID" 2>/dev/null || true
+    wait "$PERIOD_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_period EXIT
+for i in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$PERIOD_PORT/health" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+  if [ "$i" -eq 50 ]; then
+    echo "period serve did not become healthy"
+    cat "$PERIOD_LOG" || true
+    exit 1
+  fi
+done
+TODAY="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PERIOD_OLD="$(curl -s -o out/period-old.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$PERIOD_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d '{"spans":[{"timestamp":"2024-01-15T12:00:00.000Z","attributes":{"gen_ai.request.model":"gpt-4o-mini","tenant":"acme","gen_ai.cost.usd":9}}]}')"
+test "$PERIOD_OLD" = "200"
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*0' out/period-old.json
+PERIOD_TODAY="$(curl -s -o out/period-today.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$PERIOD_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d "{\"spans\":[{\"timestamp\":\"$TODAY\",\"attributes\":{\"gen_ai.request.model\":\"gpt-4o-mini\",\"tenant\":\"acme\",\"gen_ai.cost.usd\":1}}]}")"
+test "$PERIOD_TODAY" = "200"
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*0' out/period-today.json
+curl -sf "http://127.0.0.1:$PERIOD_PORT/v1/tenants.csv" -o out/period-tenants.csv
+grep -q 'acme,1.000000,2.000000,1.000000,0' out/period-tenants.csv
+PERIOD_DENY="$(curl -s -o out/period-deny.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:$PERIOD_PORT/v1/traces" \
+  -H "Content-Type: application/json" \
+  -d "{\"spans\":[{\"timestamp\":\"$TODAY\",\"attributes\":{\"gen_ai.request.model\":\"gpt-4o-mini\",\"tenant\":\"acme\",\"gen_ai.cost.usd\":1.5}}]}")"
+test "$PERIOD_DENY" = "200"
+grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/period-deny.json
+curl -sf "http://127.0.0.1:$PERIOD_PORT/v1/tenants.csv" -o out/period-tenants.csv
+grep -q 'acme,1.000000,2.000000,1.000000,1' out/period-tenants.csv
+echo "period-ok"
+cleanup_period
+PERIOD_PID=""
+trap - EXIT
+echo "==> [period] isolated UTC-day window OK"
+
 echo "==> [otlp-demo] local OTLP ingest + tenant/budget metrics"
 OTLP_DEMO_PORT="${OTLP_DEMO_PORT:-8841}" bash "$ROOT/scripts/otlp-demo.sh"
 
-echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+otlpDemo)"
+echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period+otlpDemo)"
