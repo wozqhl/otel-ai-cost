@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Local HTML dashboard (`GET /` / `--html`) shows remaining-by-tenant when `--tenant-budget` is set (same remaining as CSV/metrics; period: UTC day / cumulative). Grafana remaining panel already scraped `otel_ai_cost_budget_remaining_usd`; no new series or panel.
 - Optional UTC calendar-day budget window: `BUDGET_PERIOD=day` / `--budget-period day` (default off); remaining / denied_count / would-exceed count only the current UTC day.
 - Chargeback-lite: `GET /v1/tenants.csv` (alias `?format=csv`) exports in-memory tenant totals as `tenant,spend_usd,budget_usd,remaining_usd,denied_count`; JSON `GET /v1/tenants` unchanged.
 - Ingest/report: if span attribute `gen_ai.cost.usd` is present and a finite number ≥ 0, use it as that span's cost (would-exceed deny + webhook included); otherwise keep token × price. Not a shipped OTel convention.

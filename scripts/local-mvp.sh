@@ -1167,6 +1167,10 @@ TB_HTML="$(curl -s -o out/tb-index.html -w "%{http_code}" "http://127.0.0.1:$TB_
 test "$TB_HTML" = "200"
 grep -q "<svg" out/tb-index.html
 grep -q "TOTAL" out/tb-index.html
+grep -q 'id="budget-remaining"' out/tb-index.html
+grep -q "remaining" out/tb-index.html
+grep -q "acme" out/tb-index.html
+echo "remain-dash-ok"
 TB_GHA="$(curl -s -o out/tb-costs.gha.txt -D out/tb-costs.gha.h -w "%{http_code}" "http://127.0.0.1:$TB_PORT/v1/costs.gha.txt")"
 echo "tb_gha_status=$TB_GHA"
 test "$TB_GHA" = "200"
@@ -1192,7 +1196,7 @@ console.log("tenant_budget_thresholds_ok", d);
 cleanup_tb
 TB_PID=""
 trap - EXIT
-echo "==> [tenant-budget] curl JSON budgetBreaches acme + GHA ::error + /v1/budgets OK (isolated); CSV/html unchanged"
+echo "==> [tenant-budget] curl JSON budgetBreaches acme + GHA ::error + /v1/budgets OK (isolated); HTML remaining table present
 
 echo "==> [budgets] isolated serve --tenant-budget acme=10 (GET /v1/budgets 200; thresholds not spend)"
 BUDGETS_PORT="${BUDGETS_PORT:-8830}"
@@ -1893,6 +1897,10 @@ test "$PERIOD_DENY" = "200"
 grep -Eq '"denied"[[:space:]]*:[[:space:]]*1' out/period-deny.json
 curl -sf "http://127.0.0.1:$PERIOD_PORT/v1/tenants.csv" -o out/period-tenants.csv
 grep -q 'acme,1.000000,2.000000,1.000000,1' out/period-tenants.csv
+curl -sf "http://127.0.0.1:$PERIOD_PORT/" -o out/period-index.html
+grep -q 'id="budget-remaining"' out/period-index.html
+grep -q "period: UTC day" out/period-index.html
+grep -q "remaining" out/period-index.html
 echo "period-ok"
 cleanup_period
 PERIOD_PID=""
@@ -1902,4 +1910,4 @@ echo "==> [period] isolated UTC-day window OK"
 echo "==> [otlp-demo] local OTLP ingest + tenant/budget metrics"
 OTLP_DEMO_PORT="${OTLP_DEMO_PORT:-8841}" bash "$ROOT/scripts/otlp-demo.sh"
 
-echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period+otlpDemo)"
+echo "e-otel-ai-cost local-mvp OK (report+serve+cors+request-id+openapi+metrics+webhook+hmac+watch+csv+md+gha+rate-limit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period+remainDash+otlpDemo)"

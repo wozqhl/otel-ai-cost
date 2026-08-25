@@ -11,6 +11,7 @@
 - Accept `gen_ai.cost.usd` on a span **if present** (finite number ≥ 0) as that span's incoming cost; missing/invalid keeps token × price. Draft name only — not a shipped OTel convention (see `docs/collector-contrib-issue.md`).
 - Chargeback-lite CSV: `GET /v1/tenants.csv` from in-memory totals (`tenant,spend_usd,budget_usd,remaining_usd,denied_count`); hosted dashboard still paid later.
 - Optional `BUDGET_PERIOD=day` / `--budget-period day` so tenant remaining and deny reset at UTC midnight (default off, cumulative).
+- Local HTML dashboard remaining-by-tenant table (`GET /`) when `--tenant-budget` is set (same remaining as CSV/metrics; period label). Dedicated Grafana remaining panel already scrapes `otel_ai_cost_budget_remaining_usd` — no second series.
 
 ## Next (still OSS)
 

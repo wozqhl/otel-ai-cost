@@ -3,7 +3,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, formatTenantsCsv, DEFAULT_PRICES, applyBudgetDeny, spanTenant, ingestDenyWebhookCheck, resolveDenyOnWouldExceed, resolveBudgetPeriod, stampIngestTime, spansInBudgetPeriod, utcToday } from "./cost.js";
+import { report, formatHtml, toDailyJson, formatCsv, formatMd, formatGha, budgetsJson, modelsJson, spansJson, tenantsJson, formatTenantsCsv, DEFAULT_PRICES, applyBudgetDeny, spanTenant, ingestDenyWebhookCheck, resolveDenyOnWouldExceed, resolveBudgetPeriod, stampIngestTime, spansInBudgetPeriod, utcToday, tenantBudgetRemaining } from "./cost.js";
 import { corsResponseHeaders, handlePreflight, normalizeCors } from "./cors.js";
 import { resolveRequestId, REQUEST_ID_HEADER } from "./request-id.js";
 import { attachAccessLog } from "./access-log.js";
@@ -152,7 +152,17 @@ export function loadSpansFile(file) {
 
 function snapshotFromSpans(spans, { groupBy, prices, version, tenantBudgets, budget, denyTotal, denyByTenant, period, now }) {
   const r = report(spans || [], prices, { tenantBudgets });
-  const html = formatHtml(r, { groupBy: groupBy === "day" ? "day" : groupBy || null });
+  const remainingSource =
+    period === "day"
+      ? report(spansInBudgetPeriod(spans, period, now), prices, { tenantBudgets }).byTenant
+      : r.byTenant;
+  const remainingByTenant = tenantBudgetRemaining(remainingSource, tenantBudgets);
+  const html = formatHtml(r, {
+    groupBy: groupBy === "day" ? "day" : groupBy || null,
+    tenantBudgets,
+    period: period === "day" ? "day" : period || null,
+    remaining: remainingByTenant,
+  });
   const json = reportJson(r, { groupBy });
   const csv = formatCsv(r);
   const md = formatMd(r);

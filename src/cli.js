@@ -294,6 +294,10 @@ if (cmd === "--version" || cmd === "-V") {
     console.error("smoke html day section failed");
     process.exit(1);
   }
+  if (html.includes('id="budget-remaining"')) {
+    console.error("smoke html remaining must be absent without tenant budgets");
+    process.exit(1);
+  }
   const daily = toDailyJson(r);
   if (daily.groupBy !== "day" || !daily.days?.length) {
     console.error("smoke daily json failed", daily);
@@ -882,6 +886,22 @@ if (cmd === "--version" || cmd === "-V") {
   const acmeRemain = remain.find((x) => x.tenant === "acme");
   if (!acmeRemain || !(Number(acmeRemain.remaining) < 0)) {
     console.error("smoke tenantBudgetRemaining expected negative acme", remain);
+    process.exit(1);
+  }
+  const remainHtml = formatHtml(tbHigh, { tenantBudgets: { acme: 0.01 } });
+  if (
+    !remainHtml.includes('id="budget-remaining"') ||
+    !remainHtml.includes("remaining") ||
+    !remainHtml.includes("acme") ||
+    !remainHtml.includes(Number(acmeRemain.remaining).toFixed(6)) ||
+    !remainHtml.includes("period: cumulative")
+  ) {
+    console.error("smoke formatHtml remaining table failed");
+    process.exit(1);
+  }
+  const remainDayHtml = formatHtml(tbHigh, { tenantBudgets: { acme: 0.01 }, period: "day", remaining: remain });
+  if (!remainDayHtml.includes("period: UTC day") || !remainDayHtml.includes('id="budget-remaining"')) {
+    console.error("smoke formatHtml remaining period label failed");
     process.exit(1);
   }
   const denyPass = applyBudgetDeny(demoSpans, r, {});
@@ -3265,6 +3285,19 @@ if (cmd === "--version" || cmd === "-V") {
       process.exit(1);
     }
     console.log("export-ok", { header: exportLines[0], rows: exportLines.length - 1, tenants: exportIds });
+    const dashHtml = await (await fetch(`${exportBase}/`)).text();
+    if (
+      !dashHtml.includes('id="budget-remaining"') ||
+      !dashHtml.includes("remaining") ||
+      !dashHtml.includes("acme") ||
+      !dashHtml.includes("9.000000") ||
+      !dashHtml.includes("other") ||
+      !dashHtml.includes("3.000000")
+    ) {
+      console.error("smoke remain-dash GET / failed", dashHtml.slice(0, 800));
+      process.exit(1);
+    }
+    console.log("remain-dash-ok");
   } finally {
     await closeServer(exportServed.server);
   }
@@ -3400,12 +3433,22 @@ if (cmd === "--version" || cmd === "-V") {
       });
       process.exit(1);
     }
+    const periodHtml = await (await fetch(`${periodBase}/`)).text();
+    if (
+      !periodHtml.includes('id="budget-remaining"') ||
+      !periodHtml.includes("period: UTC day") ||
+      !periodHtml.includes("acme") ||
+      !periodHtml.includes("1.000000")
+    ) {
+      console.error("smoke period HTML remaining failed", periodHtml.slice(0, 800));
+      process.exit(1);
+    }
     console.log("period-ok");
   } finally {
     await closeServer(periodServed.server);
   }
 
-  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period`);
+  console.log(`otel-ai-cost ${VERSION} smoke OK — totalUSD=${r.totalUsd} + cors+requestId+openapi+metrics+webhook+hmac+retry+watch+shutdown+accessLog+csv+md+gha+rateLimit+tenant+tenantBudget+budgets+models+config+otlpIngest+spanMax+ingestDenyWebhook+wouldExceed+costAttr+export+period+remainDash`);
 } else if (cmd === "models" || cmd === "prices") {
   console.log(JSON.stringify(modelsJson(), null, 2));
 } else if (cmd === "demo") {
@@ -3476,7 +3519,7 @@ if (cmd === "--version" || cmd === "-V") {
   function writeHtmlFile(dest) {
     const abs = path.resolve(dest);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, formatHtml(r, { groupBy }));
+    fs.writeFileSync(abs, formatHtml(r, { groupBy, tenantBudgets }));
     console.log(JSON.stringify({ html: abs, totalUsd: r.totalUsd, rows: r.rows.length, groupBy: groupBy || null }));
   }
 
@@ -3521,7 +3564,7 @@ if (cmd === "--version" || cmd === "-V") {
     if (dest) {
       writeHtmlFile(dest);
     } else {
-      process.stdout.write(formatHtml(r, { groupBy }));
+      process.stdout.write(formatHtml(r, { groupBy, tenantBudgets }));
     }
   } else {
     const table = formatTable(r, { groupBy });

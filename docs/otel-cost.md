@@ -55,7 +55,7 @@ HTTP JSON (`GET /report.json`, `GET /v1/costs`, `GET /v1/tenants`) already expos
 
 **Budget deny:** ingest is denied when the tenant is already over budget **or** `current + incoming` would exceed it (default; exact-on-budget allowed). Denied `POST /v1/traces` spans are **not stored**. The POST stays **200** `{ ok, accepted, denied }` (`accepted` is still the parsed count, same as span-max). `DENY_ON_WOULD_EXCEED=false` restores deny-only-after-already-over. `_` is not gated unless you set a budget for `_`. No tenant budgets means deny never fires. When `--webhook-url` is set, the existing budget-breach webhook fires **once per denied request** (`tenant`, `spend`, `budget`, `denied`; HMAC/timestamp if configured; no prompt text). No webhook URL → still **200** `{denied:N}`.
 
-Grafana: dedicated `deploy/grafana/e-otel-ai-cost.json` (per-tenant spend, remaining, deny, tokens, top models). Shared portfolio panels (Total USD, Cost by model) stay in `oss-cash-lab.json` — do not edit that file from this stream.
+Grafana: dedicated `deploy/grafana/e-otel-ai-cost.json` (per-tenant spend, remaining, deny, tokens, top models). Shared portfolio panels (Total USD, Cost by model) stay in `oss-cash-lab.json` — do not edit that file from this stream. Local `GET /` HTML lists remaining-by-tenant when `--tenant-budget` is set (same remaining as `otel_ai_cost_budget_remaining_usd` / CSV; period label when `BUDGET_PERIOD=day`).
 
 
 ## How to run the demo

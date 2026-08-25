@@ -66,6 +66,7 @@ Token invoices are too coarse. Attribute cost from OTel spans to teams/features 
 - [x] OpenAPI 3 (`openapi/cost.openapi.json` + `GET /openapi.json`; `/ready` `getReady`; 403 CORS notes; `X-Request-Id`)
 - [x] Prometheus `GET /metrics` (`otel_ai_cost_total_usd`, `otel_ai_cost_by_model_usd{model}`, `otel_ai_cost_by_tenant_usd{tenant}`, `otel_ai_cost_budget_remaining_usd{tenant}`, `otel_ai_cost_budget_deny_total`, `otel_ai_cost_input_tokens`, `otel_ai_cost_output_tokens`, `otel_ai_cost_span_count`; CORS same as other GET)
 - [x] Dedicated Grafana dashboard `deploy/grafana/e-otel-ai-cost.json` (shared `oss-cash-lab.json` E panels unchanged)
+- [x] Local HTML dashboard remaining-by-tenant table (`GET /` / `--html`; same remaining as CSV/metrics; period label when `BUDGET_PERIOD=day`; Grafana remaining panel already scrapes `otel_ai_cost_budget_remaining_usd`)
 - [x] Local OTLP demo `scripts/otlp-demo.sh` (no Docker; wired from local-mvp)
 - [x] Demo with sample spans
 
@@ -119,7 +120,7 @@ node src/cli.js serve --port 8792 --in examples/spans.json
 # optional JSON access logs: --log-json or LOG_FORMAT=json (default off; skips /health /ready /metrics)
 # GET /health          JSON {ok,totalUsd,…}
 # GET /ready           always 200 {ok:true, service} + same snapshot as /health
-# GET /                HTML report (SVG chart + UTC daily)
+# GET /                HTML report (SVG chart + UTC daily + remaining-by-tenant when --tenant-budget)
 # GET /report.json     structured JSON including totalUsd + byTenant + budgetBreaches
 # GET /v1/costs.csv    finance CSV (date,model,spanCount,usd,tenant + TOTAL; empty → header only)
 # GET /v1/costs.md     FinOps Markdown (# otel-ai-cost + by-model / by-tenant tables; empty → heading + zeros)
@@ -139,7 +140,7 @@ node src/cli.js serve --port 8792 --in examples/spans.json
 
 Example spans in `examples/spans.json` include `timestamp` / `startTimeUnixNano` so costs roll up by **UTC calendar day**. One fixture span sets span attribute **`tenant=acme`**.
 
-**Tenant attribution:** read span attribute `tenant` (also `span.tenant`). Missing, null, or whitespace → `"_"` (documented sentinel, not empty string). JSON reports include `byTenant: [{ tenant, usd, spanCount, byModel }]`. `byDay` / `byModel` totals are unchanged. Finance CSV appends column `tenant` at the **end** (`date,model,spanCount,usd,tenant`) so existing header greps still pass; grain is date+model+tenant. HTML lists tenant totals after the byModel chart.
+**Tenant attribution:** read span attribute `tenant` (also `span.tenant`). Missing, null, or whitespace → `"_"` (documented sentinel, not empty string). JSON reports include `byTenant: [{ tenant, usd, spanCount, byModel }]`. `byDay` / `byModel` totals are unchanged. Finance CSV appends column `tenant` at the **end** (`date,model,spanCount,usd,tenant`) so existing header greps still pass; grain is date+model+tenant. HTML lists tenant totals after the byModel chart. When `--tenant-budget` is set, HTML also lists **budget remaining** (`tenant`, `usd`, `budget`, `remaining`; may be negative; period: UTC day when `BUDGET_PERIOD=day`, else cumulative).
 
 **Per-tenant budget (OSS):** `--tenant-budget acme=10,other=5` (CSV `tenant=usd`, also `tenant:usd`) or env **`OTEL_AI_COST_TENANT_BUDGETS`** (alias **`TENANT_BUDGETS`**). JSON object / `.json` file path also accepted. CLI wins over env (empty disables). Default **none**. After `byTenant` aggregation, if a configured tenant's `usd` **>** budget, the report includes `budgetBreaches: [{ tenant, usd, budget }]`. Catch-all `"_"` is **not** gated unless you set a budget for `_`. Global `--budget` (`maxTotalUsd` / `maxPerModelUsd`) still works independently. HTTP JSON (`GET /report.json`, `GET /v1/costs`) always includes `budgetBreaches` (empty array when unset). **`GET /v1/budgets`** returns **configured thresholds** (not spend): `{ok:true, globalUsd: number|null, tenants:{acme:10,…}}` (`globalUsd` = `--budget` `maxTotalUsd`; `tenants` = `--tenant-budget` map). Missing config → `globalUsd: null` and `tenants: {}`. No secrets. CORS + `X-Request-Id`. Missing tenant budgets → no extra webhook; never 500.
 
@@ -169,7 +170,7 @@ Finance CSV reuses those daily-by-model+tenant totals (no second price table): c
 |------|------|
 | `GET /health` | `{ok, service: otel-ai-cost, version, groupBy, spanCount, totalUsd}` |
 | `GET /ready` | Always **200** `{ok:true, service}` plus the same snapshot fields as `/health` (no circuit/queue). Compose/stack-demo healthchecks stay on `/health`. |
-| `GET /` | Self-contained HTML + SVG chart (+ UTC daily when `--group-by day`) |
+| `GET /` | Self-contained HTML + SVG chart (+ UTC daily when `--group-by day`; **budget remaining** table when `--tenant-budget` is set; period: UTC day / cumulative) |
 | `GET /report.json` | Structured JSON including `totalUsd` + `byTenant` + `budgetBreaches` (daily rollup by default; empty breaches when no `--tenant-budget`) |
 | `GET /v1/costs.csv` | Finance CSV (`text/csv`): header `date,model,spanCount,usd,tenant` (`tenant` last) from UTC daily-by-model+tenant totals + TOTAL row; missing tenant → `_`; empty spans → header only (200) |
 | `GET /v1/costs.md` | FinOps Markdown (`text/markdown; charset=utf-8`): `# otel-ai-cost` + **totalUsd** / **spans** + by-model / by-tenant tables; `|` escaped; empty → heading + zeros (200) |
@@ -234,7 +235,7 @@ Container (k8s placeholder; images not published; skip if no Docker): `docker bu
 
 If a span carries `gen_ai.cost.usd` (finite number ≥ 0), that value is the incoming cost for report, would-exceed deny, and the deny webhook; otherwise cost stays tokens × price. Ingest is denied when a tenant is already over `--tenant-budget` **or** `current + incoming` would exceed it (default ON; exact-on-budget is allowed). Denied spans are not stored; the JSON includes `denied` (HTTP 200; `accepted` stays parsed count). Set `DENY_ON_WOULD_EXCEED=false` or `--no-deny-on-would-exceed` to restore deny-only-after-already-over. When `--webhook-url` / `OTEL_AI_COST_WEBHOOK_URL` is set, the existing budget-breach webhook fires **once per denied request** (not coalesced across requests): `{ok:false, tenant, spend, budget, denied, …}`. HMAC (`X-Webhook-Signature`) and `X-Webhook-Timestamp` apply when configured. **Do not send prompt text.** No webhook URL → still **200** `{denied:N}`; webhook errors never change the ingest status.
 
-Dedicated dashboard (importable, no live Grafana): [`deploy/grafana/e-otel-ai-cost.json`](../../deploy/grafana/e-otel-ai-cost.json). Shared `oss-cash-lab.json` already has E Total USD / Cost by model; this stream does not edit it.
+Dedicated dashboard (importable, no live Grafana): [`deploy/grafana/e-otel-ai-cost.json`](../../deploy/grafana/e-otel-ai-cost.json) already has a **Budget remaining** panel on `otel_ai_cost_budget_remaining_usd` — do not invent another series or panel. Local `GET /` HTML now lists the same remaining-by-tenant rows (period-aware when `BUDGET_PERIOD=day`). Shared `oss-cash-lab.json` already has E Total USD / Cost by model; this stream does not edit it.
 
 Local OTLP demo (no Docker): `scripts/otlp-demo.sh`.
 

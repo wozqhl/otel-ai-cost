@@ -1437,7 +1437,7 @@ ${bars}
 </svg>`;
 }
 
-export function formatHtml(reportResult, { groupBy = null } = {}) {
+export function formatHtml(reportResult, { groupBy = null, tenantBudgets = null, period = null, remaining = null } = {}) {
   const esc = (s) =>
     String(s)
       .replace(/&/g, "&amp;")
@@ -1470,6 +1470,28 @@ export function formatHtml(reportResult, { groupBy = null } = {}) {
 <thead><tr><th>tenant</th><th>spans</th><th>usd</th></tr></thead>
 <tbody>
 ${tenantRows}
+</tbody>
+</table>
+`
+    : "";
+  const remainingRows = Array.isArray(remaining)
+    ? remaining
+    : tenantBudgetRemaining(tenants, tenantBudgets);
+  const remainRows = remainingRows
+    .map(
+      (t) =>
+        `<tr><td><code>${esc(t.tenant)}</code></td><td>${Number(t.usd).toFixed(6)}</td><td>${Number(t.budget).toFixed(6)}</td><td>${Number(t.remaining).toFixed(6)}</td></tr>`
+    )
+    .join("\n");
+  const periodLabel = period === "day" ? "UTC day" : "cumulative";
+  const remainSection = remainingRows.length
+    ? `
+<h2 id="budget-remaining">budget remaining</h2>
+<p class="meta">Configured <code>--tenant-budget</code> minus spend (may be negative) · period: ${esc(periodLabel)}</p>
+<table>
+<thead><tr><th>tenant</th><th>usd</th><th>budget</th><th>remaining</th></tr></thead>
+<tbody>
+${remainRows}
 </tbody>
 </table>
 `
@@ -1580,6 +1602,7 @@ ${chart}
 ${byModelList}
 </ul>
 ${tenantSection}
+${remainSection}
 ${breachSection}
 </body>
 </html>
